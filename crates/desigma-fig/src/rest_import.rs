@@ -516,6 +516,111 @@ pub(crate) fn import_rest_value_limited(v: &Value, expand_instances: bool, max_n
     Ok(cx.doc)
 }
 
+/// Incremental form of the REST importer used by `.fig` files. Callers feed
+/// one shallow converted REST node at a time in depth-first order.
+pub(crate) struct ImportSession {
+    cx: Ctx,
+    metadata: Value,
+    stack: Vec<(NodeId, ParentInfo, bool)>,
+    current_page: Option<NodeId>,
+    connectors: Vec<(NodeId, Option<String>, Option<String>)>,
+    expand_instances: bool,
+}
+
+impl ImportSession {
+    pub(crate) fn new(metadata: Value, expand_instances: bool) -> Self {
+        let mut cx = Ctx {
+            doc: Document::new(fstr(&metadata, "name").unwrap_or("Untitled")),
+            ids: BTreeMap::new(),
+            instances: Vec::new(),
+            unresolved: Vec::new(),
+            component_keys: BTreeMap::new(),
+            overrides: BTreeMap::new(),
+            next_clone: 0,
+            figjam: crate::board::is_figjam(&metadata),
+            override_keys: BTreeMap::new(),
+            scales: BTreeMap::new(),
+            library_keys: BTreeMap::new(),
+            pending_swaps: Vec::new(),
+            rest_overrides: Vec::new(),
+            proto: Vec::new(),
+            overlay_props: BTreeMap::new(),
+            flow_pages: Vec::new(),
+        };
+        if let Some(comps) = metadata.get("components").and_then(Value::as_object) {
+            for (id, c) in comps {
+                if let Some(k) = fstr(c, "key") {
+                    cx.component_keys.insert(id.clone(), k.to_string());
+                }
+            }
+        }
+        crate::variables::import_variables_value(&mut cx.doc, &metadata);
+        Self { cx, metadata, stack: Vec::new(), current_page: None, connectors: Vec::new(), expand_instances }
+    }
+
+    pub(crate) fn start_page(&mut self, page: &Value) {
+        self.stack.clear();
+        self.cx.import_page(page);
+        let Some(&pid) = self.cx.doc.pages.last() else { return };
+        self.current_page = Some(pid);
+        self.stack.push((pid, ParentInfo { origin: Vec2::ZERO, layout: None }, false));
+    }
+
+    pub(crate) fn start_library_page(&mut self) {
+        self.stack.clear();
+        self.current_page = None;
+        let lib = ensure_library_page(&mut self.cx.doc);
+        self.stack.push((lib, ParentInfo { origin: Vec2::ZERO, layout: None }, false));
+    }
+
+    pub(crate) fn start_node(&mut self, v: &Value) {
+        let Some((parent, pinfo, _)) = self.stack.last().copied() else { return };
+        let source = fstr(v, "id").map(String::from);
+        self.cx.import_node_inner(v, parent, pinfo, 0, true);
+        let Some(id) = source.as_ref().and_then(|s| self.cx.ids.get(s)).copied() else { return };
+        if let (Some(page), Some(name), Some(node_id)) = (self.current_page, v.get("_flowStart"), source.as_ref()) {
+            let name = name.as_str().filter(|s| !s.is_empty()).or_else(|| fstr(v, "name")).unwrap_or("");
+            if let Some((_, raw)) = self.cx.flow_pages.iter_mut().find(|(p, _)| *p == page) {
+                raw["flowStartingPoints"].as_array_mut().unwrap().push(serde_json::json!({"nodeId": node_id, "name": name}));
+            } else {
+                self.cx.flow_pages.push((page, serde_json::json!({"flowStartingPoints": [{"nodeId": node_id, "name": name}]})));
+            }
+        }
+        if fstr(v, "type") == Some("CONNECTOR") {
+            let target = |key: &str| v.get(key).and_then(|e| fstr(e, "endpointNodeId")).map(String::from);
+            self.connectors.push((id, target("connectorStart"), target("connectorEnd")));
+        }
+        let origin = abs_origin(v).unwrap_or(pinfo.origin);
+        let layout = self.cx.doc.get(id).and_then(|n| n.kind.frame_props()).and_then(|f| f.auto_layout).map(|a| a.direction);
+        self.stack.push((id, ParentInfo { origin, layout }, fstr(v, "type") == Some("TABLE")));
+    }
+
+    pub(crate) fn end_node(&mut self) {
+        if let Some((id, _, table)) = self.stack.pop() {
+            if table {
+                crate::board::finish_streamed_table(&mut self.cx.doc, id);
+            }
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Document {
+        self.cx.finish(self.expand_instances);
+        self.cx.register_library_assets();
+        self.cx.doc.kind = if crate::board::is_figjam(&self.metadata) { DocumentKind::Board } else { DocumentKind::Design };
+        if self.cx.doc.kind == DocumentKind::Board {
+            for p in self.cx.doc.pages.clone() {
+                if let Some(NodeKind::Page { background }) = self.cx.doc.get_mut(p).map(|n| &mut n.kind) {
+                    background.a = 0.0;
+                }
+            }
+        }
+        crate::board::link_connector_targets(&mut self.cx.doc, &self.cx.ids, &self.connectors);
+        self.cx.link_remote_components(&self.metadata);
+        self.cx.doc.style_meta = style_meta(self.metadata.get("styles"), &self.cx.doc);
+        self.cx.doc
+    }
+}
+
 impl Ctx {
     fn import_page(&mut self, v: &Value) {
         let pid = self.doc.add_page(fstr(v, "name").unwrap_or("Page"));
@@ -547,6 +652,10 @@ impl Ctx {
     }
 
     fn import_node(&mut self, v: &Value, parent: NodeId, pinfo: ParentInfo, depth: usize) {
+        self.import_node_inner(v, parent, pinfo, depth, false);
+    }
+
+    fn import_node_inner(&mut self, v: &Value, parent: NodeId, pinfo: ParentInfo, depth: usize, defer_children: bool) {
         if depth > MAX_DEPTH {
             return;
         }
@@ -613,7 +722,9 @@ impl Ctx {
         }
         if container {
             let info = ParentInfo { origin, layout: my_layout };
-            if fstr(v, "type") == Some("TABLE") {
+            if defer_children {
+                // Descendants arrive in subsequent streaming calls.
+            } else if fstr(v, "type") == Some("TABLE") {
                 for c in crate::board::table_children(v) {
                     self.import_node(c, id, info, depth + 1);
                 }

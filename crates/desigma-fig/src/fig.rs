@@ -48,8 +48,7 @@ pub fn import_fig(bytes: &[u8]) -> Result<Document, FigError> {
         return Err(FigError::Unsupported(format!("the file stores {stored} nodes; the limit is {}", crate::MAX_STORED_NODES)));
     }
     let name = d.archive.meta.as_ref().and_then(|m| fstr(m, "file_name").or_else(|| fstr(m, "name"))).unwrap_or("Untitled").to_string();
-    let rest = message_to_rest(&d.message, &name);
-    let mut doc = rest_import::import_rest_value(&rest, true)?;
+    let mut doc = import_message_streaming(&d.message, &name)?;
     doc.images = d.archive.images;
     Ok(doc)
 }
@@ -194,6 +193,7 @@ impl<'a> Lk<'a> {
 }
 
 /// Builds the REST-shaped `{name, document, ...}` value from a decoded message.
+#[cfg(test)]
 pub(crate) fn message_to_rest(msg: &KiwiValue, name: &str) -> Value {
     let blobs: Vec<&[u8]> = msg
         .get("blobs")
@@ -204,15 +204,126 @@ pub(crate) fn message_to_rest(msg: &KiwiValue, name: &str) -> Value {
     nodes_to_rest(changes, &blobs, name)
 }
 
+fn import_message_streaming(msg: &KiwiValue, name: &str) -> Result<Document, FigError> {
+    let blobs: Vec<&[u8]> = msg
+        .get("blobs")
+        .and_then(KiwiValue::as_array)
+        .map(|a| a.iter().map(|b| b.get("bytes").and_then(KiwiValue::as_bytes).unwrap_or(&[])).collect())
+        .unwrap_or_default();
+    // Phase one intentionally retains the flat node-change list for lookups,
+    // but never assembles those nodes into a second, nested REST tree.
+    let changes: Vec<Value> = msg.get("nodeChanges").and_then(KiwiValue::as_array).unwrap_or(&[]).iter().map(kiwi::to_json).collect();
+    import_changes_streaming(changes, &blobs, name)
+}
+
+fn import_changes_streaming(changes: Vec<Value>, blobs: &[&[u8]], name: &str) -> Result<Document, FigError> {
+    let mut entries = Vec::new();
+    for json in changes {
+        if fstr(&json, "phase") == Some("REMOVED") {
+            continue;
+        }
+        let Some(id) = json.get("guid").and_then(guid_str) else { continue };
+        let parent = json.get("parentIndex").and_then(|p| p.get("guid")).and_then(guid_str);
+        let pos = json.get("parentIndex").and_then(|p| fstr(p, "position")).unwrap_or("").to_string();
+        entries.push(Entry { id, parent, pos, json });
+    }
+    let index: HashMap<&str, usize> = entries.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
+    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+    let mut roots = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        match e.parent.as_deref().and_then(|p| index.get(p)) {
+            Some(&p) if p != i => children.entry(p).or_default().push(i),
+            _ => roots.push(i),
+        }
+    }
+    for list in children.values_mut() {
+        list.sort_by(|a, b| entries[*a].pos.cmp(&entries[*b].pos));
+    }
+    let doc_idx = roots.iter().copied().find(|&i| fstr(&entries[i].json, "type") == Some("DOCUMENT"));
+    let canvases = match doc_idx {
+        Some(d) => children.get(&d).cloned().unwrap_or_default(),
+        None => roots.iter().copied().filter(|&i| fstr(&entries[i].json, "type") == Some("CANVAS")).collect(),
+    };
+    let lk = Lk::new(&entries, blobs);
+    let var_entries: Vec<&Value> = entries.iter().map(|e| &e.json).filter(|j| matches!(fstr(j, "type"), Some("VARIABLE_SET" | "VARIABLE"))).collect();
+    let mut metadata = json!({"name": name, "styles": style_table(&entries)});
+    if let (Some(vars), Some(object)) = (crate::variables::from_fig_entries(&var_entries), metadata.as_object_mut()) {
+        object.insert("variables".into(), vars);
+    }
+    let mut session = rest_import::ImportSession::new(metadata, true);
+    let mut visited = HashSet::new();
+
+    fn stream_node(
+        entries: &[Entry],
+        children: &HashMap<usize, Vec<usize>>,
+        lk: &Lk,
+        i: usize,
+        visited: &mut HashSet<usize>,
+        session: &mut rest_import::ImportSession,
+        depth: usize,
+    ) {
+        if depth > 250 || !visited.insert(i) {
+            return;
+        }
+        let Some(node) = convert_node(&entries[i].json, &entries[i].id, lk).map(Value::Object) else { return };
+        session.start_node(&node);
+        drop(node); // descendants never overlap this converted REST node
+        if let Some(kids) = children.get(&i) {
+            let mut ordered = kids.clone();
+            if fstr(&entries[i].json, "type") == Some("TABLE")
+                && ordered.iter().all(|&child| fnum(&entries[child].json, "rowIndex").is_some() && fnum(&entries[child].json, "columnIndex").is_some())
+            {
+                ordered.sort_by_key(|&child| {
+                    (fnum(&entries[child].json, "rowIndex").unwrap_or(0.0) as usize, fnum(&entries[child].json, "columnIndex").unwrap_or(0.0) as usize)
+                });
+            }
+            for child in ordered {
+                stream_node(entries, children, lk, child, visited, session, depth + 1);
+            }
+        }
+        session.end_node();
+    }
+
+    for &canvas in &canvases {
+        if entries[canvas].json.get("internalOnly").and_then(Value::as_bool) == Some(true) {
+            continue;
+        }
+        let Some(page) = convert_node(&entries[canvas].json, &entries[canvas].id, &lk).map(Value::Object) else { continue };
+        session.start_page(&page);
+        drop(page);
+        if let Some(kids) = children.get(&canvas) {
+            for &child in kids {
+                stream_node(&entries, &children, &lk, child, &mut visited, &mut session, 1);
+            }
+        }
+    }
+    for &canvas in &canvases {
+        if entries[canvas].json.get("internalOnly").and_then(Value::as_bool) != Some(true) {
+            continue;
+        }
+        let Some(kids) = children.get(&canvas).filter(|k| !k.is_empty()) else { continue };
+        // Match the legacy `libraryPages` filter: an internal canvas whose
+        // direct children are all non-content machinery creates no page.
+        if !kids.iter().any(|&child| convert_node(&entries[child].json, &entries[child].id, &lk).is_some()) {
+            continue;
+        }
+        session.start_library_page();
+        for &child in kids {
+            stream_node(&entries, &children, &lk, child, &mut visited, &mut session, 1);
+        }
+    }
+    Ok(session.finish())
+}
+
 /// Imports node changes given as kiwi-shaped JSON (`[{guid, parentIndex, type, ...}]`,
 /// enums by name), as `fig2json` prints them. For synthetic test fixtures.
 #[doc(hidden)]
 pub fn import_fig_node_changes(changes: &Value, name: &str) -> Result<Document, FigError> {
     let list = changes.as_array().cloned().unwrap_or_default();
-    let rest = nodes_to_rest(list, &[], name);
-    rest_import::import_rest_value(&rest, true)
+    import_changes_streaming(list, &[], name)
 }
 
+#[cfg(test)]
 fn nodes_to_rest(changes: Vec<Value>, blobs: &[&[u8]], name: &str) -> Value {
     let mut entries: Vec<Entry> = Vec::new();
     for j in changes {
@@ -303,6 +414,7 @@ fn style_table(entries: &[Entry]) -> Value {
     Value::Object(out)
 }
 
+#[cfg(test)]
 fn build(entries: &[Entry], children: &HashMap<usize, Vec<usize>>, lk: &Lk, i: usize, visited: &mut HashSet<usize>, depth: usize) -> Option<Value> {
     if depth > 250 || !visited.insert(i) {
         return None;
@@ -401,6 +513,10 @@ fn convert_node(nc: &Value, id: &str, lk: &Lk) -> Option<Map<String, Value>> {
     copy(&mut m, nc, "blendMode", "blendMode");
     copy(&mut m, nc, "mask", "isMask");
     copy(&mut m, nc, "size", "size");
+    // FigJam tables need their explicit grid dimensions while the streaming
+    // importer is still handling the shallow table node.
+    copy(&mut m, nc, "numRows", "numRows");
+    copy(&mut m, nc, "numColumns", "numColumns");
     if let Some(t) = nc.get("transform") {
         m.insert("relativeTransform".into(), matrix_json(t));
     }
@@ -568,6 +684,7 @@ fn convert_node(nc: &Value, id: &str, lk: &Lk) -> Option<Map<String, Value>> {
                 m.insert("_derived".into(), Value::Array(derived));
             }
         }
+        "TABLE_CELL" => copy(&mut m, nc, "characters", "characters"),
         "TEXT" => convert_text(&mut m, nc, lk),
         _ => {}
     }
@@ -1192,6 +1309,18 @@ mod tests {
         assert_eq!((doc[2].format, doc[2].constraint), (F::Pdf, C::Height(64.0)));
         assert_eq!(convert_guides(&nc).unwrap(), json!([{"axis": "X", "offset": 10.0}, {"axis": "Y", "offset": 4.5}]));
         assert!(convert_export_settings(&json!({})).is_none() && convert_guides(&json!({})).is_none());
+    }
+
+    #[test]
+    fn streaming_import_matches_the_legacy_rest_tree() {
+        use crate::container::Compression;
+
+        let bytes = crate::testkit::sample_fig(Compression::Deflate, true);
+        let decoded = decode(&bytes).unwrap();
+        let name = "Sample file";
+        let legacy = rest_import::import_rest_value(&message_to_rest(&decoded.message, name), true).unwrap();
+        let streamed = import_message_streaming(&decoded.message, name).unwrap();
+        assert_eq!(crate::export::export_rest_json(&streamed), crate::export::export_rest_json(&legacy));
     }
 
     #[test]
