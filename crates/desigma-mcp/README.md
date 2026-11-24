@@ -65,7 +65,7 @@ desigma_save_file     {"path":"output-v2.desigma"}
 
 Edits remain in memory until saved. Restarting the server loses unsaved work. Opening another file or starting a new document resets undo history and refuses to discard pending edits unless `discard_changes: true` is explicitly supplied. Save each revision under a new filename, or overwrite the file you opened with `overwrite: true`. Requests are handled one at a time in the order they arrive, so a batch of calls written in one go runs and answers in sequence. Tool failures return an MCP error result with an explanatory message.
 
-Imports are limited to 64 MiB per file, 100,000 layers, and 256 levels of nesting. The server validates the imported document graph before using it, rejecting malformed parent/child relationships and cycles.
+Imports are limited to 256 MiB per file, 100,000 layers (the hidden library page of a `.fig`, which holds non-editable copies of library components, is not counted), and 256 levels of nesting. A `.fig` that stores more than 150,000 nodes, or whose component instances would expand past 250,000 nodes, is rejected while it is being read. The server validates the imported document graph before using it, rejecting malformed parent/child relationships and cycles.
 
 ## Tools
 

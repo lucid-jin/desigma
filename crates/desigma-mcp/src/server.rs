@@ -232,9 +232,6 @@ impl Session {
                     return Err("Unsaved changes: save to a new .desigma file, or set discard_changes=true".into());
                 }
                 let path = self.input_path(&a.path)?;
-                if fs::metadata(&path).map_err(|e| e.to_string())?.len() > 64 * 1024 * 1024 {
-                    return Err("Input file exceeds the 64 MiB import limit".into());
-                }
                 let doc = desigma_library::load_external(&path).map_err(|e| format!("Cannot import design: {e}"))?;
                 crate::engine::validate_document(&doc)?;
                 self.engine = Engine::default();

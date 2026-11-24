@@ -124,11 +124,20 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
     Ok(res?)
 }
 
+/// Largest file `load_external` accepts. One limit for every import entry point (the editor,
+/// the MCP server), so they cannot drift apart. Node counts and decompressed sizes are bounded
+/// separately, while the import runs.
+pub const MAX_IMPORT_BYTES: u64 = 256 * 1024 * 1024;
+
 /// Loads a document from any importable file: `.desigma` / `.json` (native or
-/// Figma REST), `.fig`, `.pen` (Pencil) or `.svg`.
+/// Figma REST), `.fig`, `.pen` (Pencil) or `.svg`. Files over [`MAX_IMPORT_BYTES`] are rejected
+/// before they are read.
 pub fn load_external(path: &Path) -> Result<Document> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let invalid = |m: String| LibraryError::Invalid(m);
+    if std::fs::metadata(path)?.len() > MAX_IMPORT_BYTES {
+        return Err(invalid(format!("Input file exceeds the {} MiB import limit", MAX_IMPORT_BYTES >> 20)));
+    }
     let mut doc = match ext.as_str() {
         "fig" => desigma_fig::import_fig(&std::fs::read(path)?).map_err(|e| invalid(format!("Cannot import .fig: {e}")))?,
         "pen" => {
@@ -697,6 +706,21 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn import_size_limit_is_checked_before_reading() {
+        let (_tmp, lib) = Tmp::new();
+        let at = |bytes: u64| {
+            let p = lib.root().join(format!("size_{bytes}.json"));
+            std::fs::File::create(&p).unwrap().set_len(bytes).unwrap();
+            p
+        };
+        let err = load_external(&at(MAX_IMPORT_BYTES + 1)).unwrap_err().to_string();
+        assert!(err.contains("256 MiB import limit"), "{err}");
+        // At the limit the size check passes; the zero-filled file then fails as invalid JSON, not as too large.
+        let err = load_external(&at(MAX_IMPORT_BYTES)).unwrap_err().to_string();
+        assert!(!err.contains("import limit"), "{err}");
     }
 
     fn doc(name: &str, rects: usize) -> Document {

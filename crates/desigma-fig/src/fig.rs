@@ -43,6 +43,10 @@ pub fn decode_fig_to_json(bytes: &[u8]) -> Result<Value, FigError> {
 /// Imports a `.fig` file (raw fig-kiwi or zip-wrapped) from bytes.
 pub fn import_fig(bytes: &[u8]) -> Result<Document, FigError> {
     let d = decode(bytes)?;
+    let stored = d.message.get("nodeChanges").and_then(KiwiValue::as_array).map_or(0, <[_]>::len);
+    if stored > crate::MAX_STORED_NODES {
+        return Err(FigError::Unsupported(format!("the file stores {stored} nodes; the limit is {}", crate::MAX_STORED_NODES)));
+    }
     let name = d.archive.meta.as_ref().and_then(|m| fstr(m, "file_name").or_else(|| fstr(m, "name"))).unwrap_or("Untitled").to_string();
     let rest = message_to_rest(&d.message, &name);
     let mut doc = rest_import::import_rest_value(&rest, true)?;

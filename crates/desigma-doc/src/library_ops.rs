@@ -411,6 +411,21 @@ pub fn is_library_node(doc: &Document, id: NodeId) -> bool {
     id == lp || doc.is_ancestor(lp, id)
 }
 
+/// How many nodes sit on the hidden library page (the page node included). They are copies of
+/// library components: nobody selects or edits them, so size limits count `nodes.len()` minus this.
+pub fn library_node_count(doc: &Document) -> usize {
+    let Some(lp) = doc.library_page.filter(|p| doc.nodes.contains_key(p)) else { return 0 };
+    let mut count = 0;
+    let mut stack = vec![lp];
+    while let Some(id) = stack.pop() {
+        count += 1;
+        if let Some(n) = doc.nodes.get(&id) {
+            stack.extend(n.children.iter().copied());
+        }
+    }
+    count
+}
+
 /// The library asset a component node belongs to: `(external key, entry)`. A
 /// variant resolves to its set.
 pub fn library_asset_of_component(doc: &Document, comp: NodeId) -> Option<(&String, &ExternalAsset)> {
@@ -1272,6 +1287,23 @@ pub fn link_remote_component(doc: &mut Document, library_id: &str, key: &str, na
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn library_node_count_counts_the_page_and_everything_under_it() {
+        let mut d = Document::new("L");
+        let page = d.add_page("P");
+        assert_eq!(library_node_count(&d), 0, "no library page yet");
+        let lp = ensure_library_page(&mut d);
+        let a = d.alloc_id();
+        let a = d.insert(lp, Node::frame(a, Rect::new(0.0, 0.0, 10.0, 10.0))).unwrap();
+        for _ in 0..3 {
+            let id = d.alloc_id();
+            d.insert(a, Node::rectangle(id, Rect::new(0.0, 0.0, 1.0, 1.0))).unwrap();
+        }
+        let id = d.alloc_id();
+        d.insert(page, Node::rectangle(id, Rect::new(0.0, 0.0, 1.0, 1.0))).unwrap();
+        assert_eq!(library_node_count(&d), 5, "page + frame + 3 rectangles; the real page's rectangle is not counted");
+    }
 
     fn lib_doc() -> Document {
         let mut d = Document::new("Lib");

@@ -348,6 +348,11 @@ struct Ctx {
     overlay_props: BTreeMap<String, Value>,
     /// `flowStartingPoints` of each page.
     flow_pages: Vec<(NodeId, Value)>,
+    /// Instance expansion stops once the document holds this many nodes.
+    max_nodes: usize,
+    /// Set when `max_nodes` stopped an expansion; the import then fails instead of returning a
+    /// document with half-copied instances.
+    over_budget: bool,
 }
 
 /// Overrides carried on `.fig` instance JSON as `_overrides` / `_derived`:
@@ -423,10 +428,21 @@ pub fn import_rest_json(json: &str) -> Result<Document, FigError> {
     import_rest_value(&v, false)
 }
 
+/// [`import_rest_json`] that expands instances and fails past `max_nodes`. For tests.
+#[doc(hidden)]
+pub fn import_rest_json_limited(json: &str, max_nodes: usize) -> Result<Document, FigError> {
+    let v = parse_json_text(json)?;
+    import_rest_value_limited(&v, true, max_nodes)
+}
+
 /// Maps an already-parsed REST-shaped value. `expand_instances` clones the
 /// component subtree into childless instances (used by `.fig`, where instance
 /// children are often not stored).
 pub(crate) fn import_rest_value(v: &Value, expand_instances: bool) -> Result<Document, FigError> {
+    import_rest_value_limited(v, expand_instances, crate::MAX_IMPORT_NODES)
+}
+
+pub(crate) fn import_rest_value_limited(v: &Value, expand_instances: bool, max_nodes: usize) -> Result<Document, FigError> {
     let root = match v.get("document") {
         Some(d) => d,
         None if fstr(v, "type").is_some() => v,
@@ -449,6 +465,8 @@ pub(crate) fn import_rest_value(v: &Value, expand_instances: bool) -> Result<Doc
         proto: Vec::new(),
         overlay_props: BTreeMap::new(),
         flow_pages: Vec::new(),
+        max_nodes,
+        over_budget: false,
     };
     if let Some(comps) = v.get("components").and_then(Value::as_object) {
         for (id, c) in comps {
@@ -479,6 +497,9 @@ pub(crate) fn import_rest_value(v: &Value, expand_instances: bool) -> Result<Doc
         }
     }
     cx.finish(expand_instances);
+    if cx.over_budget {
+        return Err(FigError::Unsupported(format!("expanding instances would exceed {max_nodes} nodes; the file has too many component instances to import")));
+    }
     cx.register_library_assets();
     cx.doc.kind = if crate::board::is_figjam(v) { DocumentKind::Board } else { DocumentKind::Design };
     if cx.doc.kind == DocumentKind::Board {
@@ -888,6 +909,9 @@ impl Ctx {
         let mut done = BTreeSet::new();
         let order: Vec<NodeId> = targets.keys().copied().collect();
         for inst in order {
+            if self.over_budget {
+                return;
+            }
             self.expand_rec(inst, &targets, &mut done);
         }
         // Instances whose component is unknown still honour their own overrides.
@@ -1256,7 +1280,11 @@ impl Ctx {
     }
 
     fn clone_subtree(&mut self, src: NodeId, parent: NodeId, prefix: &str, budget: &mut usize, depth: usize) {
-        if *budget == 0 || depth > MAX_DEPTH {
+        if *budget == 0 || depth > MAX_DEPTH || self.over_budget {
+            return;
+        }
+        if self.doc.nodes.len() >= self.max_nodes {
+            self.over_budget = true;
             return;
         }
         *budget -= 1;
