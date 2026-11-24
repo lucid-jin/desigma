@@ -2,7 +2,7 @@
 //!
 //! The importer builds `Document` nodes incrementally; serialization writes the
 //! finished document straight to the destination file without creating a JSON
-//! string in memory.
+//! string in memory. A large document is written packed (see `desigma_doc::Document::to_file_bytes`).
 
 use std::fs::OpenOptions;
 use std::io::{BufWriter, Write};
@@ -49,8 +49,7 @@ fn write_atomic(path: &Path, doc: &desigma_fig::Document) -> Result<(), Box<dyn 
 
     let result = (|| -> Result<(), Box<dyn std::error::Error>> {
         let mut writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(&mut writer, doc)?;
-        writer.write_all(b"\n")?;
+        doc.write_file_form(&mut writer)?;
         writer.flush()?;
         writer.get_ref().sync_all()?;
         drop(writer);

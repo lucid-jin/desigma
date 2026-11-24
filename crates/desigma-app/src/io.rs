@@ -61,8 +61,8 @@ fn load_unguarded(path: &Path) -> Result<(Document, Vec<String>), String> {
             doc
         }
         _ => {
-            let text = std::fs::read_to_string(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
-            Document::from_json(&text).map_err(|e| format!("Invalid desigma file: {e}"))?
+            let bytes = std::fs::read(path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?;
+            Document::from_file_bytes(&bytes).map_err(|e| format!("Invalid desigma file: {e}"))?
         }
     };
     if doc.name.is_empty() {
@@ -85,8 +85,8 @@ pub fn save_path(doc: &Document, path: &Path) -> Result<PathBuf, String> {
     if p.extension().is_none() {
         p.set_extension(NATIVE_EXT);
     }
-    let json = doc.to_json().map_err(|e| format!("Cannot serialize: {e}"))?;
-    std::fs::write(&p, json).map_err(|e| format!("Cannot write {}: {e}", p.display()))?;
+    let bytes = doc.to_file_bytes().map_err(|e| format!("Cannot serialize: {e}"))?;
+    std::fs::write(&p, bytes).map_err(|e| format!("Cannot write {}: {e}", p.display()))?;
     Ok(p)
 }
 
