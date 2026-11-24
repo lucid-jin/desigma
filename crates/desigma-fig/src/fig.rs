@@ -7,12 +7,13 @@
 
 use crate::container::{self, Archive};
 use crate::kiwi::{self, KiwiValue, Schema};
+use crate::outline::{FigOutline, ImportOptions, OutlineFrame, OutlinePage};
 use crate::rest_import::{self, fnum, fstr};
 use crate::svgpath::write_path;
 use crate::FigError;
 use desigma_doc::{Affine, Document, FillRule, Path, PathCmd, Vec2};
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 struct Decoded {
     archive: Archive,
@@ -42,15 +43,166 @@ pub fn decode_fig_to_json(bytes: &[u8]) -> Result<Value, FigError> {
 
 /// Imports a `.fig` file (raw fig-kiwi or zip-wrapped) from bytes.
 pub fn import_fig(bytes: &[u8]) -> Result<Document, FigError> {
-    let d = decode(bytes)?;
+    import_fig_with(bytes, &ImportOptions::default())
+}
+
+fn check_stored(d: &Decoded) -> Result<(), FigError> {
     let stored = d.message.get("nodeChanges").and_then(KiwiValue::as_array).map_or(0, <[_]>::len);
     if stored > crate::MAX_STORED_NODES {
         return Err(FigError::Unsupported(format!("the file stores {stored} nodes; the limit is {}", crate::MAX_STORED_NODES)));
     }
-    let name = d.archive.meta.as_ref().and_then(|m| fstr(m, "file_name").or_else(|| fstr(m, "name"))).unwrap_or("Untitled").to_string();
-    let mut doc = import_message_streaming(&d.message, &name)?;
+    Ok(())
+}
+
+fn file_name(d: &Decoded) -> String {
+    d.archive.meta.as_ref().and_then(|m| fstr(m, "file_name").or_else(|| fstr(m, "name"))).unwrap_or("Untitled").to_string()
+}
+
+/// [`import_fig`] with [`ImportOptions`]: all of the file, or only the frames that were picked.
+pub fn import_fig_with(bytes: &[u8], opts: &ImportOptions) -> Result<Document, FigError> {
+    let d = decode(bytes)?;
+    check_stored(&d)?;
+    let mut doc = import_message_streaming_with(&d.message, &file_name(&d), opts.only_frames.as_ref())?;
     doc.images = d.archive.images;
+    if opts.only_frames.is_some() {
+        // the frames left out take their images with them
+        let used: std::collections::BTreeSet<String> = rest_import::image_refs(&doc).into_iter().collect();
+        doc.images.retain(|k, _| used.contains(k));
+    }
     Ok(doc)
+}
+
+/// Lists the pages of a `.fig` file and the top-level frames on each, with their weight, without
+/// importing it. See [`FigOutline`].
+pub fn outline_fig(bytes: &[u8]) -> Result<FigOutline, FigError> {
+    let d = decode(bytes)?;
+    check_stored(&d)?;
+    let blobs = blobs_of(&d.message);
+    let nodes = d.message.get("nodeChanges").and_then(KiwiValue::as_array).unwrap_or(&[]);
+    let entries = entries_of(nodes);
+    let tree = Tree::new(&entries);
+    let lk = Lk::new(&entries, &blobs);
+    let mut out = FigOutline {
+        stored_nodes: nodes.len(),
+        image_count: d.archive.images.len(),
+        image_bytes: d.archive.images.values().map(|v| v.len() as u64).sum(),
+        ..Default::default()
+    };
+    for &canvas in &tree.canvases {
+        let page = convert_node(&node_json(&entries, Some(nodes), canvas), &entries[canvas].id, &lk);
+        let name = page.as_ref().and_then(|m| m.get("name")).and_then(Value::as_str).unwrap_or("Page").to_string();
+        let mut frames = Vec::new();
+        for &top in tree.children.get(&canvas).map(Vec::as_slice).unwrap_or(&[]) {
+            let Some(top_json) = convert_node(&node_json(&entries, Some(nodes), top), &entries[top].id, &lk) else { continue };
+            let name = top_json.get("name").and_then(Value::as_str).unwrap_or("").to_string();
+            let (mut count, mut images) = (0usize, BTreeSet::new());
+            let mut stack = vec![(top, 0usize)];
+            let mut seen = HashSet::new();
+            while let Some((i, depth)) = stack.pop() {
+                if depth > 250 || !seen.insert(i) {
+                    continue;
+                }
+                count += 1;
+                if let Some(m) = convert_node(&node_json(&entries, Some(nodes), i), &entries[i].id, &lk) {
+                    collect_image_refs(&Value::Object(m), &mut images);
+                }
+                stack.extend(tree.children.get(&i).into_iter().flatten().map(|&c| (c, depth + 1)));
+            }
+            let image_bytes = images.iter().filter_map(|h| d.archive.images.get(h)).map(|v| v.len() as u64).sum();
+            frames.push(OutlineFrame { id: entries[top].id.clone(), name, kind: entries[top].ty.clone(), nodes: count, image_bytes });
+        }
+        out.pages.push(OutlinePage { id: entries[canvas].id.clone(), name, internal: entries[canvas].internal, frames });
+    }
+    Ok(out)
+}
+
+/// The top-level units (children of a page) to import when frames were picked: the picked ones,
+/// and every other unit they depend on, so that what they use still works. A node depends on
+/// another when its JSON mentions that node's id anywhere (the component an instance is of, a
+/// swap candidate, a style, a node inside a component an override reaches). The units a unit
+/// depends on are followed in turn. Library components live in the hidden page's units, so a
+/// pick keeps the library parts it uses and leaves the rest of the library out.
+fn units_to_import(entries: &[Entry], nodes: Option<&[KiwiValue]>, tree: &Tree, only: &BTreeSet<String>) -> HashSet<usize> {
+    let by_id: HashMap<&str, usize> = entries.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
+    // which top-level unit every node sits in
+    let mut unit_of: Vec<Option<usize>> = vec![None; entries.len()];
+    let mut picked = Vec::new();
+    for &canvas in &tree.canvases {
+        for &top in tree.children.get(&canvas).into_iter().flatten() {
+            if !entries[canvas].internal && only.contains(&entries[top].id) {
+                picked.push(top);
+            }
+            let mut stack = vec![top];
+            while let Some(i) = stack.pop() {
+                if unit_of[i].is_some() {
+                    continue;
+                }
+                unit_of[i] = Some(top);
+                stack.extend(tree.children.get(&i).into_iter().flatten().copied());
+            }
+        }
+    }
+    let mut keep: HashSet<usize> = picked.iter().copied().collect();
+    let mut work = picked;
+    while let Some(unit) = work.pop() {
+        let mut stack = vec![unit];
+        let mut seen = HashSet::new();
+        while let Some(i) = stack.pop() {
+            if !seen.insert(i) {
+                continue;
+            }
+            let mut ids = BTreeSet::new();
+            mentioned_ids(&node_json(entries, nodes, i), true, &mut ids);
+            for id in ids {
+                if let Some(&j) = by_id.get(id.as_str()) {
+                    if let Some(u) = unit_of[j].filter(|u| keep.insert(*u)) {
+                        work.push(u);
+                    }
+                }
+            }
+            stack.extend(tree.children.get(&i).into_iter().flatten().copied());
+        }
+    }
+    keep
+}
+
+/// Ids (`session:local`) of every node a JSON value mentions, apart from the node's own `guid`
+/// and its place in the tree (`parentIndex`).
+fn mentioned_ids(v: &Value, top: bool, out: &mut BTreeSet<String>) {
+    match v {
+        Value::Object(m) => {
+            if m.contains_key("sessionID") && m.contains_key("localID") {
+                out.extend(guid_str(v));
+                return;
+            }
+            for (k, x) in m {
+                if top && matches!(k.as_str(), "guid" | "parentIndex") {
+                    continue;
+                }
+                mentioned_ids(x, false, out);
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| mentioned_ids(x, false, out)),
+        _ => {}
+    }
+}
+
+/// Every `imageRef` string in a converted node (fills, strokes, text styles).
+fn collect_image_refs(v: &Value, out: &mut BTreeSet<String>) {
+    match v {
+        Value::Object(m) => {
+            for (k, x) in m {
+                match (k.as_str(), x) {
+                    ("imageRef", Value::String(h)) => {
+                        out.insert(h.clone());
+                    }
+                    _ => collect_image_refs(x, out),
+                }
+            }
+        }
+        Value::Array(a) => a.iter().for_each(|x| collect_image_refs(x, out)),
+        _ => {}
+    }
 }
 
 // ------------------------------------------------------------------ tree
@@ -280,23 +432,64 @@ pub(crate) fn message_to_rest(msg: &KiwiValue, name: &str) -> Value {
     nodes_to_rest(changes, &blobs, name)
 }
 
-fn import_message_streaming(msg: &KiwiValue, name: &str) -> Result<Document, FigError> {
-    let blobs: Vec<&[u8]> = msg
-        .get("blobs")
+fn blobs_of(msg: &KiwiValue) -> Vec<&[u8]> {
+    msg.get("blobs")
         .and_then(KiwiValue::as_array)
         .map(|a| a.iter().map(|b| b.get("bytes").and_then(KiwiValue::as_bytes).unwrap_or(&[])).collect())
-        .unwrap_or_default();
-    // The node list is never turned into JSON as a whole: each node is converted when it is
-    // visited, and only the few nodes other nodes look things up in are kept as JSON.
-    let nodes = msg.get("nodeChanges").and_then(KiwiValue::as_array).unwrap_or(&[]);
+        .unwrap_or_default()
+}
+
+/// The entries of a decoded message's node list. The nodes are never turned into JSON as a
+/// whole: each is converted when it is visited, and only the few nodes other nodes look things up
+/// in are kept as JSON.
+fn entries_of(nodes: &[KiwiValue]) -> Vec<Entry> {
     let has_motion = nodes.iter().any(|n| matches!(n.get("type"), Some(KiwiValue::Enum(t)) if matches!(&**t, "KEYFRAME_TRACK" | "ANIMATION_PRESET_INSTANCE")));
-    let entries: Vec<Entry> = nodes.iter().enumerate().filter_map(|(i, n)| Entry::from_kiwi(i, n, has_motion)).collect();
-    import_entries_streaming(entries, Some(nodes), &blobs, name)
+    nodes.iter().enumerate().filter_map(|(i, n)| Entry::from_kiwi(i, n, has_motion)).collect()
+}
+
+/// Parent-to-children links of the entries (children in position order) and the page nodes.
+struct Tree {
+    children: HashMap<usize, Vec<usize>>,
+    canvases: Vec<usize>,
+}
+
+impl Tree {
+    fn new(entries: &[Entry]) -> Tree {
+        let index: HashMap<&str, usize> = entries.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
+        let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut roots = Vec::new();
+        for (i, e) in entries.iter().enumerate() {
+            match e.parent.as_deref().and_then(|p| index.get(p)) {
+                Some(&p) if p != i => children.entry(p).or_default().push(i),
+                _ => roots.push(i),
+            }
+        }
+        for list in children.values_mut() {
+            list.sort_by(|a, b| entries[*a].pos.cmp(&entries[*b].pos));
+        }
+        let doc_idx = roots.iter().copied().find(|&i| entries[i].ty == "DOCUMENT");
+        let canvases = match doc_idx {
+            Some(d) => children.get(&d).cloned().unwrap_or_default(),
+            None => roots.iter().copied().filter(|&i| entries[i].ty == "CANVAS").collect(),
+        };
+        Tree { children, canvases }
+    }
+}
+
+#[cfg(test)]
+fn import_message_streaming(msg: &KiwiValue, name: &str) -> Result<Document, FigError> {
+    import_message_streaming_with(msg, name, None)
+}
+
+fn import_message_streaming_with(msg: &KiwiValue, name: &str, only: Option<&BTreeSet<String>>) -> Result<Document, FigError> {
+    let blobs = blobs_of(msg);
+    let nodes = msg.get("nodeChanges").and_then(KiwiValue::as_array).unwrap_or(&[]);
+    import_entries_streaming(entries_of(nodes), Some(nodes), &blobs, name, only)
 }
 
 fn import_changes_streaming(changes: Vec<Value>, blobs: &[&[u8]], name: &str) -> Result<Document, FigError> {
     let entries: Vec<Entry> = changes.into_iter().enumerate().filter_map(|(i, j)| Entry::from_json(i, j)).collect();
-    import_entries_streaming(entries, None, blobs, name)
+    import_entries_streaming(entries, None, blobs, name, None)
 }
 
 /// The JSON of entry `i`: the one it kept, or converted from the message on the spot.
@@ -307,24 +500,16 @@ fn node_json<'a>(entries: &'a [Entry], nodes: Option<&[KiwiValue]>, i: usize) ->
     }
 }
 
-fn import_entries_streaming(entries: Vec<Entry>, nodes: Option<&[KiwiValue]>, blobs: &[&[u8]], name: &str) -> Result<Document, FigError> {
-    let index: HashMap<&str, usize> = entries.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
-    let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
-    let mut roots = Vec::new();
-    for (i, e) in entries.iter().enumerate() {
-        match e.parent.as_deref().and_then(|p| index.get(p)) {
-            Some(&p) if p != i => children.entry(p).or_default().push(i),
-            _ => roots.push(i),
-        }
-    }
-    for list in children.values_mut() {
-        list.sort_by(|a, b| entries[*a].pos.cmp(&entries[*b].pos));
-    }
-    let doc_idx = roots.iter().copied().find(|&i| entries[i].ty == "DOCUMENT");
-    let canvases = match doc_idx {
-        Some(d) => children.get(&d).cloned().unwrap_or_default(),
-        None => roots.iter().copied().filter(|&i| entries[i].ty == "CANVAS").collect(),
-    };
+fn import_entries_streaming(
+    entries: Vec<Entry>,
+    nodes: Option<&[KiwiValue]>,
+    blobs: &[&[u8]],
+    name: &str,
+    only: Option<&BTreeSet<String>>,
+) -> Result<Document, FigError> {
+    let tree = Tree::new(&entries);
+    let keep = only.map(|set| units_to_import(&entries, nodes, &tree, set));
+    let Tree { children, canvases } = tree;
     let lk = Lk::new(&entries, blobs);
     let var_entries: Vec<&Value> = entries.iter().filter(|e| matches!(e.ty.as_str(), "VARIABLE_SET" | "VARIABLE")).map(|e| &e.json).collect();
     let mut metadata = json!({"name": name, "styles": style_table(&entries)});
@@ -363,31 +548,53 @@ fn import_entries_streaming(entries: Vec<Entry>, nodes: Option<&[KiwiValue]>, bl
     }
     let walk = Walk { entries: &entries, nodes, children: &children, lk: &lk };
 
+    // With `only`, a page keeps just its picked top-level frames, and a page with none is left out.
+    let mut matched: BTreeSet<&str> = BTreeSet::new();
     for &canvas in &canvases {
         if entries[canvas].internal {
+            continue;
+        }
+        let picked: Vec<usize> =
+            children.get(&canvas).map(|kids| kids.iter().copied().filter(|c| keep.as_ref().is_none_or(|k| k.contains(c))).collect()).unwrap_or_default();
+        if only.is_some() && picked.is_empty() {
             continue;
         }
         let Some(page) = convert_node(&node_json(&entries, nodes, canvas), &entries[canvas].id, &lk).map(Value::Object) else { continue };
         session.start_page(&page);
         drop(page);
-        if let Some(kids) = children.get(&canvas) {
-            for &child in kids {
-                stream_node(&walk, child, &mut visited, &mut session, 1);
+        for child in picked {
+            if only.is_some_and(|set| set.contains(&entries[child].id)) {
+                matched.insert(entries[child].id.as_str());
             }
+            stream_node(&walk, child, &mut visited, &mut session, 1);
+        }
+    }
+    if let Some(set) = only {
+        if set.is_empty() {
+            return Err(FigError::Unsupported("no frames were picked".into()));
+        }
+        if let Some(missing) = set.iter().find(|id| !matched.contains(id.as_str())) {
+            return Err(FigError::Unsupported(format!("the file has no top-level frame with id {missing}")));
         }
     }
     for &canvas in &canvases {
         if !entries[canvas].internal {
             continue;
         }
-        let Some(kids) = children.get(&canvas).filter(|k| !k.is_empty()) else { continue };
+        let Some(kids) = children
+            .get(&canvas)
+            .map(|k| k.iter().copied().filter(|c| keep.as_ref().is_none_or(|u| u.contains(c))).collect::<Vec<_>>())
+            .filter(|k| !k.is_empty())
+        else {
+            continue;
+        };
         // Match the legacy `libraryPages` filter: an internal canvas whose
         // direct children are all non-content machinery creates no page.
         if !kids.iter().any(|&child| convert_node(&node_json(&entries, nodes, child), &entries[child].id, &lk).is_some()) {
             continue;
         }
         session.start_library_page();
-        for &child in kids {
+        for child in kids {
             stream_node(&walk, child, &mut visited, &mut session, 1);
         }
     }
@@ -1462,6 +1669,43 @@ mod tests {
         let back = Document::from_file_bytes(&bytes).unwrap();
         assert_eq!((back.nodes.len(), back.pages.len(), back.images.len()), (doc.nodes.len(), doc.pages.len(), doc.images.len()));
         assert_eq!(digest(&doc), digest(&back));
+    }
+
+    /// Real-file check, run by hand: `FIG_FILE=<path> FIG_FRAMES=<name part>,<name part> cargo test -p
+    /// desigma-fig --release --lib -- --ignored real_file_pick`. Every picked frame must come out of
+    /// the partial import exactly as it comes out of the full one (REST export of that frame).
+    #[test]
+    #[ignore]
+    fn real_file_pick_matches_the_full_import() {
+        fn find<'a>(v: &'a Value, id: &str) -> Option<&'a Value> {
+            if v.get("id").and_then(Value::as_str) == Some(id) {
+                return Some(v);
+            }
+            v.get("children")?.as_array()?.iter().find_map(|c| find(c, id))
+        }
+        let path = std::env::var("FIG_FILE").expect("set FIG_FILE");
+        let parts = std::env::var("FIG_FRAMES").expect("set FIG_FRAMES (comma separated name parts)");
+        let bytes = std::fs::read(path).unwrap();
+        let outline = outline_fig(&bytes).unwrap();
+        let picked: Vec<(String, String)> = outline
+            .pages
+            .iter()
+            .filter(|p| !p.internal)
+            .flat_map(|p| &p.frames)
+            .filter(|f| parts.split(',').any(|part| f.name.contains(part)))
+            .map(|f| (f.id.clone(), f.name.clone()))
+            .collect();
+        assert!(!picked.is_empty(), "no frame matches {parts}");
+        let full = crate::export::export_rest_json(&import_fig(&bytes).unwrap());
+        let ids = picked.iter().map(|(id, _)| id.clone()).collect();
+        let part_doc = import_fig_with(&bytes, &ImportOptions { only_frames: Some(ids) }).unwrap();
+        println!("partial import: {} nodes, {} images", part_doc.nodes.len(), part_doc.images.len());
+        let part = crate::export::export_rest_json(&part_doc);
+        for (id, name) in &picked {
+            let (a, b) = (find(&full["document"], id).expect("in full"), find(&part["document"], id).expect("in partial"));
+            assert_eq!(a, b, "frame {name} ({id}) differs");
+            println!("frame {name} ({id}): identical");
+        }
     }
 
     #[test]

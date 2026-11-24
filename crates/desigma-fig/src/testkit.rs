@@ -1534,3 +1534,69 @@ pub fn groups_fig(how: Compression) -> Vec<u8> {
     let root = schema.find("Message").unwrap();
     container::write_container(&schema.encode(), &schema.encode_message(root, &body).unwrap(), how, 106)
 }
+
+/// Three top-level frames on one page and one on another, with images of different sizes:
+/// `Hero` uses image 1 and the library component `LibButton`; `Footer` uses images 1 and 2;
+/// `Empty` uses the component `Badge`, which lives in page two's frame `Other` (image 3). The
+/// library also holds `LibUnused` (image 4), which nothing uses. See `tests/frame_select.rs`.
+pub fn frames_fig() -> Vec<u8> {
+    let hash = |n: u8| [0xa0, n, 0, 0];
+    let picture = |l: u32, parent: u32, hashes: &[u8]| {
+        let paints: Vec<V> = hashes
+            .iter()
+            .map(|h| msg(vec![("type", en("IMAGE")), ("image", msg(vec![("hash", V::Bytes(hash(*h).to_vec()))])), ("imageScaleMode", en("FILL"))]))
+            .collect();
+        node((3, l), (3, parent), "a", "ROUNDED_RECTANGLE", "Picture", vec![("size", vec2(10.0, 10.0)), ("fillPaints", V::Array(paints))])
+    };
+    let frame = |l: u32, page: u32, pos: &str, name: &str| {
+        node((3, l), (0, page), pos, "FRAME", name, vec![("size", vec2(40.0, 40.0)), ("transform", matrix(10.0 * l as f32, 0.0))])
+    };
+    let nodes = vec![
+        node((0, 0), (0, 0), "!", "DOCUMENT", "Document", vec![]),
+        node((0, 1), (0, 0), "a", "CANVAS", "Landing", vec![]),
+        node((0, 2), (0, 0), "b", "CANVAS", "Other page", vec![]),
+        frame(1, 1, "a", "Hero"),
+        picture(11, 1, &[1]),
+        frame(2, 1, "b", "Footer"),
+        picture(21, 2, &[1, 2]),
+        frame(3, 1, "c", "Empty"),
+        frame(4, 2, "a", "Other"),
+        picture(41, 4, &[3]),
+        // Hero uses a library component; Empty uses a component that lives in the frame Other
+        node((0, 9), (0, 0), "z", "CANVAS", "Internal Only Canvas", vec![("internalOnly", V::Bool(true))]),
+        node((4, 1), (0, 9), "a", "SYMBOL", "LibButton", vec![("size", vec2(10.0, 10.0))]),
+        node((4, 11), (4, 1), "a", "ROUNDED_RECTANGLE", "LibButton bg", vec![("size", vec2(10.0, 10.0))]),
+        node((4, 2), (0, 9), "b", "SYMBOL", "LibUnused", vec![("size", vec2(10.0, 10.0))]),
+        node(
+            (4, 21),
+            (4, 2),
+            "a",
+            "ROUNDED_RECTANGLE",
+            "LibUnused art",
+            vec![
+                ("size", vec2(10.0, 10.0)),
+                (
+                    "fillPaints",
+                    V::Array(vec![msg(vec![
+                        ("type", en("IMAGE")),
+                        ("image", msg(vec![("hash", V::Bytes(hash(4).to_vec()))])),
+                        ("imageScaleMode", en("FILL")),
+                    ])]),
+                ),
+            ],
+        ),
+        node((3, 12), (3, 1), "b", "INSTANCE", "Use LibButton", vec![("size", vec2(10.0, 10.0)), ("symbolData", msg(vec![("symbolID", guid(4, 1))]))]),
+        node((3, 50), (3, 4), "b", "SYMBOL", "Badge", vec![("size", vec2(10.0, 10.0))]),
+        picture(51, 50, &[3]),
+        node((3, 31), (3, 3), "a", "INSTANCE", "Use Badge", vec![("size", vec2(10.0, 10.0)), ("symbolData", msg(vec![("symbolID", guid(3, 50))]))]),
+    ];
+    let body = msg(vec![("nodeChanges", V::Array(nodes)), ("blobs", V::Array(vec![]))]);
+    let schema = figma_like_schema();
+    let root = schema.find("Message").unwrap();
+    let canvas = container::write_container(&schema.encode(), &schema.encode_message(root, &body).unwrap(), Compression::Deflate, 107);
+    let mut images = BTreeMap::new();
+    for (n, len) in [(1u8, 1000usize), (2, 2000), (3, 4000), (4, 8000)] {
+        images.insert(crate::kiwi::hex(&hash(n)), vec![n; len]);
+    }
+    container::write_zip(&canvas, &images, Some(&serde_json::json!({"file_name": "Frames"})))
+}

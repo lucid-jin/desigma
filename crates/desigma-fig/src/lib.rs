@@ -17,6 +17,7 @@ mod export;
 mod fig;
 pub mod kiwi;
 mod motion;
+mod outline;
 mod proto;
 #[cfg(feature = "net")]
 pub mod rest;
@@ -32,7 +33,8 @@ pub use desigma_doc::Document;
 pub use export::export_rest_json;
 #[doc(hidden)]
 pub use fig::import_fig_node_changes;
-pub use fig::{commands_blob_to_path, decode_fig_to_json, import_fig};
+pub use fig::{commands_blob_to_path, decode_fig_to_json, import_fig, import_fig_with, outline_fig};
+pub use outline::{FigOutline, ImportOptions, OutlineFrame, OutlinePage};
 pub use proto::{gamepad_button_code, gamepad_button_name, key_code, key_name};
 #[doc(hidden)]
 pub use rest_import::import_rest_json_limited;
