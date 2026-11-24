@@ -512,6 +512,7 @@ pub(crate) fn import_rest_value_limited(v: &Value, expand_instances: bool, max_n
     }
     crate::board::link_connectors(&mut cx.doc, &cx.ids, root);
     cx.link_remote_components(v);
+    cx.check_total_nodes()?;
     cx.doc.style_meta = style_meta(v.get("styles"), &cx.doc);
     Ok(cx.doc)
 }
@@ -624,12 +625,25 @@ impl ImportSession {
         }
         crate::board::link_connector_targets(&mut self.cx.doc, &self.cx.ids, &self.connectors);
         self.cx.link_remote_components(&self.metadata);
+        self.cx.check_total_nodes()?;
         self.cx.doc.style_meta = style_meta(self.metadata.get("styles"), &self.cx.doc);
         Ok(self.cx.doc)
     }
 }
 
 impl Ctx {
+    /// The node budget after everything is in: instance expansion stops at the budget as it goes,
+    /// but linking remote components afterwards adds a placeholder per distinct unresolved one.
+    fn check_total_nodes(&self) -> Result<(), FigError> {
+        let (total, max) = (self.doc.nodes.len(), self.max_nodes);
+        if total > max {
+            return Err(FigError::Unsupported(format!(
+                "the import would hold {total} nodes, past the limit of {max} (the file uses too many remote components)"
+            )));
+        }
+        Ok(())
+    }
+
     fn import_page(&mut self, v: &Value) {
         let pid = self.doc.add_page(fstr(v, "name").unwrap_or("Page"));
         if let Some(src) = fstr(v, "id") {

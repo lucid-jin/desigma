@@ -227,7 +227,7 @@ fn validate_document_with_limit(doc: &Document, max_layers: usize) -> Result<(),
     use std::collections::BTreeSet;
     // The hidden library page holds non-editable copies of library components; the limit is on
     // the layers an agent or user can actually work with.
-    if doc.nodes.len() - desigma_doc::library_node_count(doc) > max_layers {
+    if doc.nodes.len().saturating_sub(desigma_doc::library_node_count(doc)) > max_layers {
         return Err(format!("Document exceeds the {max_layers} layer limit"));
     }
     for (id, node) in &doc.nodes {
@@ -963,6 +963,25 @@ mod tests {
         let err = validate_document_with_limit(&doc_with(21, 0), 20).unwrap_err();
         assert!(err.contains("20 layer limit"), "{err}");
         assert!(validate_document(&doc_with(10, 30)).is_ok());
+    }
+
+    #[test]
+    fn a_damaged_library_page_is_an_error_not_a_hang_or_a_panic() {
+        // The limit is computed before the graph is checked, so it must survive what the check
+        // is there to report: a child linked twice (the count used to underflow) and a link
+        // back up to the library page (the walk used to never end).
+        let mut dup = doc_with(2, 3);
+        let lp = dup.library_page.unwrap();
+        let first = dup.get(lp).unwrap().children[0];
+        dup.nodes.get_mut(&lp).unwrap().children.push(first);
+        let err = validate_document(&dup).unwrap_err();
+        assert!(err.contains("duplicate or inconsistent child links"), "{err}");
+
+        let mut cycle = doc_with(2, 3);
+        let lp = cycle.library_page.unwrap();
+        let first = cycle.get(lp).unwrap().children[0];
+        cycle.nodes.get_mut(&first).unwrap().children.push(lp);
+        assert!(validate_document(&cycle).is_err());
     }
 
     #[test]
