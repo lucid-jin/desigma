@@ -546,6 +546,8 @@ impl ImportSession {
             proto: Vec::new(),
             overlay_props: BTreeMap::new(),
             flow_pages: Vec::new(),
+            max_nodes: crate::MAX_IMPORT_NODES,
+            over_budget: false,
         };
         if let Some(comps) = metadata.get("components").and_then(Value::as_object) {
             for (id, c) in comps {
@@ -603,8 +605,14 @@ impl ImportSession {
         }
     }
 
-    pub(crate) fn finish(mut self) -> Document {
+    pub(crate) fn finish(mut self) -> Result<Document, FigError> {
         self.cx.finish(self.expand_instances);
+        if self.cx.over_budget {
+            let max_nodes = self.cx.max_nodes;
+            return Err(FigError::Unsupported(format!(
+                "expanding instances would exceed {max_nodes} nodes; the file has too many component instances to import"
+            )));
+        }
         self.cx.register_library_assets();
         self.cx.doc.kind = if crate::board::is_figjam(&self.metadata) { DocumentKind::Board } else { DocumentKind::Design };
         if self.cx.doc.kind == DocumentKind::Board {
@@ -617,7 +625,7 @@ impl ImportSession {
         crate::board::link_connector_targets(&mut self.cx.doc, &self.cx.ids, &self.connectors);
         self.cx.link_remote_components(&self.metadata);
         self.cx.doc.style_meta = style_meta(self.metadata.get("styles"), &self.cx.doc);
-        self.cx.doc
+        Ok(self.cx.doc)
     }
 }
 

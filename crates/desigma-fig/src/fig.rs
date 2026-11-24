@@ -59,7 +59,83 @@ struct Entry {
     id: String,
     parent: Option<String>,
     pos: String,
+    /// The node's `type`, `internalOnly` and table position, read once so the traversal does
+    /// not need the node itself.
+    ty: String,
+    internal: bool,
+    row: Option<f32>,
+    col: Option<f32>,
+    /// Index into the message's `nodeChanges`; the node is converted to JSON when it is
+    /// visited and dropped right after.
+    src: usize,
+    /// The node as JSON. Only nodes other nodes look things up in (styles, variables, motion,
+    /// component property definitions) keep it; for every other node of a decoded message this
+    /// is `Null`, which is what keeps the whole file from being held as JSON at once.
     json: Value,
+}
+
+impl Entry {
+    /// An entry that owns its node as JSON (synthetic fixtures and the legacy tree builder).
+    fn from_json(src: usize, json: Value) -> Option<Entry> {
+        if fstr(&json, "phase") == Some("REMOVED") {
+            return None;
+        }
+        let id = json.get("guid").and_then(guid_str)?;
+        let parent = json.get("parentIndex").and_then(|p| p.get("guid")).and_then(guid_str);
+        let pos = json.get("parentIndex").and_then(|p| fstr(p, "position")).unwrap_or("").to_string();
+        Some(Entry {
+            id,
+            parent,
+            pos,
+            ty: fstr(&json, "type").unwrap_or("").to_string(),
+            internal: json.get("internalOnly").and_then(Value::as_bool) == Some(true),
+            row: fnum(&json, "rowIndex"),
+            col: fnum(&json, "columnIndex"),
+            src,
+            json,
+        })
+    }
+
+    /// An entry read straight from a kiwi node. The node is kept as JSON only when
+    /// [`needed_by_lookups`] says other nodes read it.
+    fn from_kiwi(src: usize, node: &KiwiValue, has_motion: bool) -> Option<Entry> {
+        let field = |name: &str| node.get(name).map(kiwi::to_json);
+        if field("phase").as_ref().and_then(Value::as_str) == Some("REMOVED") {
+            return None;
+        }
+        let id = field("guid").as_ref().and_then(guid_str)?;
+        let parent_index = field("parentIndex");
+        let parent = parent_index.as_ref().and_then(|p| p.get("guid")).and_then(guid_str);
+        let pos = parent_index.as_ref().and_then(|p| fstr(p, "position")).unwrap_or("").to_string();
+        let ty = field("type").as_ref().and_then(Value::as_str).unwrap_or("").to_string();
+        let num = |name: &str| field(name).as_ref().and_then(Value::as_f64).map(|n| n as f32);
+        let keep = needed_by_lookups(&ty, node, has_motion);
+        Some(Entry {
+            id,
+            parent,
+            pos,
+            internal: field("internalOnly").as_ref().and_then(Value::as_bool) == Some(true),
+            row: num("rowIndex"),
+            col: num("columnIndex"),
+            ty,
+            src,
+            json: if keep { kiwi::to_json(node) } else { Value::Null },
+        })
+    }
+}
+
+/// Whether other nodes look this one up: shared styles, variables and variable sets, the nodes
+/// motion is read from, and nodes that define component properties (`Lk::new`, `motion::extract`).
+/// Wide on purpose: keeping a node as JSON that did not need it only costs memory.
+///
+/// Nodes that merely carry a `parameterConsumptionMap` (variable bindings, most nodes of a
+/// design-system file) only matter to motion when the file has keyframe tracks or animation
+/// presets at all; without those, `motion::extract` finds nothing in them.
+fn needed_by_lookups(ty: &str, node: &KiwiValue, has_motion: bool) -> bool {
+    matches!(ty, "VARIABLE" | "VARIABLE_SET" | "KEYFRAME" | "KEYFRAME_TRACK" | "ANIMATION_PRESET_INSTANCE" | "CODE_COMPONENT")
+        || node.get("styleType").is_some()
+        || node.get("componentPropDefs").and_then(KiwiValue::as_array).is_some_and(|a| !a.is_empty())
+        || (has_motion && (node.get("parameterConsumptionMap").is_some() || node.get("animationPresets").is_some()))
 }
 
 pub(crate) fn guid_str(g: &Value) -> Option<String> {
@@ -210,23 +286,28 @@ fn import_message_streaming(msg: &KiwiValue, name: &str) -> Result<Document, Fig
         .and_then(KiwiValue::as_array)
         .map(|a| a.iter().map(|b| b.get("bytes").and_then(KiwiValue::as_bytes).unwrap_or(&[])).collect())
         .unwrap_or_default();
-    // Phase one intentionally retains the flat node-change list for lookups,
-    // but never assembles those nodes into a second, nested REST tree.
-    let changes: Vec<Value> = msg.get("nodeChanges").and_then(KiwiValue::as_array).unwrap_or(&[]).iter().map(kiwi::to_json).collect();
-    import_changes_streaming(changes, &blobs, name)
+    // The node list is never turned into JSON as a whole: each node is converted when it is
+    // visited, and only the few nodes other nodes look things up in are kept as JSON.
+    let nodes = msg.get("nodeChanges").and_then(KiwiValue::as_array).unwrap_or(&[]);
+    let has_motion = nodes.iter().any(|n| matches!(n.get("type"), Some(KiwiValue::Enum(t)) if matches!(&**t, "KEYFRAME_TRACK" | "ANIMATION_PRESET_INSTANCE")));
+    let entries: Vec<Entry> = nodes.iter().enumerate().filter_map(|(i, n)| Entry::from_kiwi(i, n, has_motion)).collect();
+    import_entries_streaming(entries, Some(nodes), &blobs, name)
 }
 
 fn import_changes_streaming(changes: Vec<Value>, blobs: &[&[u8]], name: &str) -> Result<Document, FigError> {
-    let mut entries = Vec::new();
-    for json in changes {
-        if fstr(&json, "phase") == Some("REMOVED") {
-            continue;
-        }
-        let Some(id) = json.get("guid").and_then(guid_str) else { continue };
-        let parent = json.get("parentIndex").and_then(|p| p.get("guid")).and_then(guid_str);
-        let pos = json.get("parentIndex").and_then(|p| fstr(p, "position")).unwrap_or("").to_string();
-        entries.push(Entry { id, parent, pos, json });
+    let entries: Vec<Entry> = changes.into_iter().enumerate().filter_map(|(i, j)| Entry::from_json(i, j)).collect();
+    import_entries_streaming(entries, None, blobs, name)
+}
+
+/// The JSON of entry `i`: the one it kept, or converted from the message on the spot.
+fn node_json<'a>(entries: &'a [Entry], nodes: Option<&[KiwiValue]>, i: usize) -> std::borrow::Cow<'a, Value> {
+    match (&entries[i].json, nodes) {
+        (Value::Null, Some(n)) => std::borrow::Cow::Owned(kiwi::to_json(&n[entries[i].src])),
+        (j, _) => std::borrow::Cow::Borrowed(j),
     }
+}
+
+fn import_entries_streaming(entries: Vec<Entry>, nodes: Option<&[KiwiValue]>, blobs: &[&[u8]], name: &str) -> Result<Document, FigError> {
     let index: HashMap<&str, usize> = entries.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
     let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut roots = Vec::new();
@@ -239,13 +320,13 @@ fn import_changes_streaming(changes: Vec<Value>, blobs: &[&[u8]], name: &str) ->
     for list in children.values_mut() {
         list.sort_by(|a, b| entries[*a].pos.cmp(&entries[*b].pos));
     }
-    let doc_idx = roots.iter().copied().find(|&i| fstr(&entries[i].json, "type") == Some("DOCUMENT"));
+    let doc_idx = roots.iter().copied().find(|&i| entries[i].ty == "DOCUMENT");
     let canvases = match doc_idx {
         Some(d) => children.get(&d).cloned().unwrap_or_default(),
-        None => roots.iter().copied().filter(|&i| fstr(&entries[i].json, "type") == Some("CANVAS")).collect(),
+        None => roots.iter().copied().filter(|&i| entries[i].ty == "CANVAS").collect(),
     };
     let lk = Lk::new(&entries, blobs);
-    let var_entries: Vec<&Value> = entries.iter().map(|e| &e.json).filter(|j| matches!(fstr(j, "type"), Some("VARIABLE_SET" | "VARIABLE"))).collect();
+    let var_entries: Vec<&Value> = entries.iter().filter(|e| matches!(e.ty.as_str(), "VARIABLE_SET" | "VARIABLE")).map(|e| &e.json).collect();
     let mut metadata = json!({"name": name, "styles": style_table(&entries)});
     if let (Some(vars), Some(object)) = (crate::variables::from_fig_entries(&var_entries), metadata.as_object_mut()) {
         object.insert("variables".into(), vars);
@@ -253,66 +334,64 @@ fn import_changes_streaming(changes: Vec<Value>, blobs: &[&[u8]], name: &str) ->
     let mut session = rest_import::ImportSession::new(metadata, true);
     let mut visited = HashSet::new();
 
-    fn stream_node(
-        entries: &[Entry],
-        children: &HashMap<usize, Vec<usize>>,
-        lk: &Lk,
-        i: usize,
-        visited: &mut HashSet<usize>,
-        session: &mut rest_import::ImportSession,
-        depth: usize,
-    ) {
+    /// What `stream_node` reads: the entries, the message they came from, the tree and the lookups.
+    struct Walk<'w> {
+        entries: &'w [Entry],
+        nodes: Option<&'w [KiwiValue]>,
+        children: &'w HashMap<usize, Vec<usize>>,
+        lk: &'w Lk<'w>,
+    }
+
+    fn stream_node(w: &Walk, i: usize, visited: &mut HashSet<usize>, session: &mut rest_import::ImportSession, depth: usize) {
         if depth > 250 || !visited.insert(i) {
             return;
         }
-        let Some(node) = convert_node(&entries[i].json, &entries[i].id, lk).map(Value::Object) else { return };
+        let entries = w.entries;
+        let Some(node) = convert_node(&node_json(entries, w.nodes, i), &entries[i].id, w.lk).map(Value::Object) else { return };
         session.start_node(&node);
         drop(node); // descendants never overlap this converted REST node
-        if let Some(kids) = children.get(&i) {
+        if let Some(kids) = w.children.get(&i) {
             let mut ordered = kids.clone();
-            if fstr(&entries[i].json, "type") == Some("TABLE")
-                && ordered.iter().all(|&child| fnum(&entries[child].json, "rowIndex").is_some() && fnum(&entries[child].json, "columnIndex").is_some())
-            {
-                ordered.sort_by_key(|&child| {
-                    (fnum(&entries[child].json, "rowIndex").unwrap_or(0.0) as usize, fnum(&entries[child].json, "columnIndex").unwrap_or(0.0) as usize)
-                });
+            if entries[i].ty == "TABLE" && ordered.iter().all(|&child| entries[child].row.is_some() && entries[child].col.is_some()) {
+                ordered.sort_by_key(|&child| (entries[child].row.unwrap_or(0.0) as usize, entries[child].col.unwrap_or(0.0) as usize));
             }
             for child in ordered {
-                stream_node(entries, children, lk, child, visited, session, depth + 1);
+                stream_node(w, child, visited, session, depth + 1);
             }
         }
         session.end_node();
     }
+    let walk = Walk { entries: &entries, nodes, children: &children, lk: &lk };
 
     for &canvas in &canvases {
-        if entries[canvas].json.get("internalOnly").and_then(Value::as_bool) == Some(true) {
+        if entries[canvas].internal {
             continue;
         }
-        let Some(page) = convert_node(&entries[canvas].json, &entries[canvas].id, &lk).map(Value::Object) else { continue };
+        let Some(page) = convert_node(&node_json(&entries, nodes, canvas), &entries[canvas].id, &lk).map(Value::Object) else { continue };
         session.start_page(&page);
         drop(page);
         if let Some(kids) = children.get(&canvas) {
             for &child in kids {
-                stream_node(&entries, &children, &lk, child, &mut visited, &mut session, 1);
+                stream_node(&walk, child, &mut visited, &mut session, 1);
             }
         }
     }
     for &canvas in &canvases {
-        if entries[canvas].json.get("internalOnly").and_then(Value::as_bool) != Some(true) {
+        if !entries[canvas].internal {
             continue;
         }
         let Some(kids) = children.get(&canvas).filter(|k| !k.is_empty()) else { continue };
         // Match the legacy `libraryPages` filter: an internal canvas whose
         // direct children are all non-content machinery creates no page.
-        if !kids.iter().any(|&child| convert_node(&entries[child].json, &entries[child].id, &lk).is_some()) {
+        if !kids.iter().any(|&child| convert_node(&node_json(&entries, nodes, child), &entries[child].id, &lk).is_some()) {
             continue;
         }
         session.start_library_page();
         for &child in kids {
-            stream_node(&entries, &children, &lk, child, &mut visited, &mut session, 1);
+            stream_node(&walk, child, &mut visited, &mut session, 1);
         }
     }
-    Ok(session.finish())
+    session.finish()
 }
 
 /// Imports node changes given as kiwi-shaped JSON (`[{guid, parentIndex, type, ...}]`,
@@ -325,16 +404,7 @@ pub fn import_fig_node_changes(changes: &Value, name: &str) -> Result<Document, 
 
 #[cfg(test)]
 fn nodes_to_rest(changes: Vec<Value>, blobs: &[&[u8]], name: &str) -> Value {
-    let mut entries: Vec<Entry> = Vec::new();
-    for j in changes {
-        if fstr(&j, "phase") == Some("REMOVED") {
-            continue;
-        }
-        let Some(id) = j.get("guid").and_then(guid_str) else { continue };
-        let parent = j.get("parentIndex").and_then(|p| p.get("guid")).and_then(guid_str);
-        let pos = j.get("parentIndex").and_then(|p| fstr(p, "position")).unwrap_or("").to_string();
-        entries.push(Entry { id, parent, pos, json: j });
-    }
+    let entries: Vec<Entry> = changes.into_iter().enumerate().filter_map(|(i, j)| Entry::from_json(i, j)).collect();
 
     let index: HashMap<&str, usize> = entries.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
     let mut children: HashMap<usize, Vec<usize>> = HashMap::new();
@@ -1321,6 +1391,47 @@ mod tests {
         let legacy = rest_import::import_rest_value(&message_to_rest(&decoded.message, name), true).unwrap();
         let streamed = import_message_streaming(&decoded.message, name).unwrap();
         assert_eq!(crate::export::export_rest_json(&streamed), crate::export::export_rest_json(&legacy));
+    }
+
+    /// Real-file check, run by hand: `FIG_FILE=<path> cargo test -p desigma-fig --release -- --ignored real_file_matches_legacy`.
+    /// The streamed import (nodes converted one at a time) must equal the legacy REST-tree import.
+    #[test]
+    #[ignore]
+    fn real_file_matches_legacy_rest_tree() {
+        use std::hash::Hasher;
+        struct H(std::collections::hash_map::DefaultHasher, usize);
+        impl std::io::Write for H {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.write(b);
+                self.1 += b.len();
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        fn digest(doc: &Document) -> (u64, usize) {
+            let mut h = H(Default::default(), 0);
+            serde_json::to_writer(&mut h, &crate::export::export_rest_json(doc)).unwrap();
+            // The whole native document too: library pages and extras the REST export leaves out.
+            serde_json::to_writer(&mut h, doc).unwrap();
+            (h.0.finish(), h.1)
+        }
+        let path = std::env::var("FIG_FILE").expect("set FIG_FILE to a .fig path");
+        let bytes = std::fs::read(path).unwrap();
+        let decoded = decode(&bytes).unwrap();
+        let legacy = {
+            let doc = rest_import::import_rest_value(&message_to_rest(&decoded.message, "f"), true).unwrap();
+            let d = digest(&doc);
+            (d, doc.nodes.len(), doc.pages.len())
+        };
+        let streamed = {
+            let doc = import_message_streaming(&decoded.message, "f").unwrap();
+            let d = digest(&doc);
+            (d, doc.nodes.len(), doc.pages.len())
+        };
+        println!("legacy {legacy:?}\nstreamed {streamed:?}");
+        assert_eq!(legacy, streamed);
     }
 
     #[test]
