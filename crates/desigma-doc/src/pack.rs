@@ -11,7 +11,7 @@
 //! a small file cannot expand into memory without bound.
 
 use crate::{Document, DocumentKind};
-use flate2::{read::GzDecoder, write::GzEncoder, Compression};
+use flate2::{bufread::GzDecoder, write::GzEncoder, Compression};
 use serde::de::{self, Deserialize, Deserializer as _, MapAccess, Visitor};
 use std::cell::Cell;
 use std::io::{self, BufReader, BufWriter, Read, Write};
@@ -53,8 +53,8 @@ fn is_packed(bytes: &[u8]) -> bool {
     bytes.starts_with(&GZIP_MAGIC)
 }
 
-fn unpacker(bytes: &[u8], limit: u64) -> BufReader<Capped<GzDecoder<&[u8]>>> {
-    BufReader::new(Capped { inner: GzDecoder::new(bytes), left: limit, limit })
+fn unpacker<R: Read>(unpacked: R, limit: u64) -> BufReader<Capped<R>> {
+    BufReader::new(Capped { inner: unpacked, left: limit, limit })
 }
 
 impl Document {
@@ -101,9 +101,18 @@ impl Document {
             let text = std::str::from_utf8(bytes).map_err(de::Error::custom)?;
             return Self::from_json(text);
         }
-        let mut de = serde_json::Deserializer::from_reader(unpacker(bytes, limit));
-        let doc = Self::deserialize(&mut de)?;
-        de.end()?;
+        // `GzDecoder` reads one gzip member and stops, leaving whatever follows in `bytes`. A
+        // document ends where its member does: plain JSON rejects trailing text, and so does this.
+        let mut gz = GzDecoder::new(bytes);
+        let doc = {
+            let mut de = serde_json::Deserializer::from_reader(unpacker(&mut gz, limit));
+            let doc = Self::deserialize(&mut de)?;
+            de.end()?;
+            doc
+        };
+        if !gz.get_ref().is_empty() {
+            return Err(de::Error::custom(format!("{} bytes after the end of the packed document", gz.get_ref().len())));
+        }
         Ok(doc.finish_load())
     }
 
@@ -131,7 +140,7 @@ impl Document {
 
         let found = Cell::new(None);
         let result = if is_packed(bytes) {
-            serde_json::Deserializer::from_reader(unpacker(bytes, MAX_UNPACKED_BYTES)).deserialize_map(Find(&found))
+            serde_json::Deserializer::from_reader(unpacker(GzDecoder::new(bytes), MAX_UNPACKED_BYTES)).deserialize_map(Find(&found))
         } else {
             serde_json::Deserializer::from_slice(bytes).deserialize_map(Find(&found))
         };
@@ -202,6 +211,28 @@ mod tests {
         assert!(Document::from_file_bytes(&packed).is_err());
         assert!(Document::from_file_bytes(&[0x1f, 0x8b, 0, 0]).is_err());
         assert!(Document::from_file_bytes(b"not json").is_err());
+    }
+
+    #[test]
+    fn a_packed_file_must_end_where_its_gzip_member_ends() {
+        let packed = doc_with(50).to_file_bytes_above(10).unwrap();
+        assert!(Document::from_file_bytes(&packed).is_ok());
+
+        let mut garbage = packed.clone();
+        garbage.extend_from_slice(b"trailing bytes nobody parsed");
+        let err = Document::from_file_bytes(&garbage).unwrap_err().to_string();
+        assert!(err.contains("after the end of the packed document"), "{err}");
+
+        // a second, valid gzip member is data the document parser never examined either
+        let mut two = packed.clone();
+        two.extend_from_slice(&doc_with(3).to_file_bytes_above(0).unwrap());
+        assert!(Document::from_file_bytes(&two).is_err());
+
+        // a single stray byte, and a truncated trailer, are caught as well
+        let mut one = packed.clone();
+        one.push(0);
+        assert!(Document::from_file_bytes(&one).is_err());
+        assert!(Document::from_file_bytes(&packed[..packed.len() - 4]).is_err());
     }
 
     #[test]

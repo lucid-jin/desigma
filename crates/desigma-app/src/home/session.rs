@@ -214,7 +214,8 @@ impl App {
     }
 
     /// [`Self::save_library_file`]; with `only_changes` a document identical to the saved one is
-    /// not rewritten. The document is serialized once, for both the comparison and the write.
+    /// not rewritten. The comparison streams the document through a hasher (no text is built); only
+    /// a changed document is serialized again, packed, for the write.
     /// Returns whether the file was written.
     fn write_library_file(&mut self, only_changes: bool) -> Result<bool, String> {
         crate::decks::ui::flush_notes(self);
