@@ -26,6 +26,23 @@ fn expansion_past_the_budget_fails_instead_of_half_copying() {
     assert!(err.contains("exceed 60 nodes"), "{err}");
 }
 
+/// A page of `n` instances of components that are not in the file (each a different remote one).
+fn remote_file(n: usize) -> String {
+    let uses: Vec<_> = (0..n)
+        .map(|i| json!({"id": format!("2:{i}"), "name": "Use", "type": "INSTANCE", "componentId": format!("9:{i}"), "size": {"x": 10, "y": 10}}))
+        .collect();
+    json!({"name": "remote", "document": {"type": "DOCUMENT", "children": [{"id": "0:1", "type": "CANVAS", "name": "P", "children": uses}]}}).to_string()
+}
+
+#[test]
+fn remote_component_placeholders_count_toward_the_budget() {
+    // 1 page + 50 instances = 51 nodes pass expansion, but linking 50 distinct remote components
+    // adds a library page and a placeholder each: well past 60.
+    let err = import_rest_json_limited(&remote_file(50), 60).unwrap_err().to_string();
+    assert!(err.contains("past the limit of 60"), "{err}");
+    assert!(import_rest_json_limited(&remote_file(50), 1_000).is_ok());
+}
+
 #[test]
 fn the_budget_stops_the_copying_early() {
     // 20,000 instances of a 50-part component would copy a million nodes; the import must give
