@@ -46,15 +46,15 @@ fn fit(doc: &Document, page: NodeId) -> Viewport {
 fn main() {
     let path = std::env::args().nth(1).expect("usage: bench_file FILE.desigma");
     let t = Instant::now();
-    let text = std::fs::read_to_string(&path).expect("read");
+    let bytes = std::fs::read(&path).expect("read");
     let read = ms(t.elapsed());
     let t = Instant::now();
-    let doc = Document::from_json(&text).expect("parse");
+    let doc = Document::from_file_bytes(&bytes).expect("parse");
     println!("file {path}\n  read {read:.0} ms, parse {:.0} ms, {} nodes, {} images", ms(t.elapsed()), doc.nodes.len(), doc.images.len());
     let t = Instant::now();
-    let json = doc.to_json().unwrap();
-    println!("  to_json (doc_hash, autosave) {:.0} ms, {:.1} MB", ms(t.elapsed()), json.len() as f64 / 1e6);
-    drop(json);
+    let packed = doc.to_file_bytes().unwrap();
+    println!("  to_file_bytes (what a save writes) {:.0} ms, {:.1} MB", ms(t.elapsed()), packed.len() as f64 / 1e6);
+    drop(packed);
 
     let page = *doc.pages.iter().max_by_key(|p| page_nodes(&doc, **p)).unwrap();
     println!("  busiest page: {} nodes", page_nodes(&doc, page));

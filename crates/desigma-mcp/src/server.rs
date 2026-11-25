@@ -257,8 +257,8 @@ impl Session {
             "desigma_save_file" => {
                 let a: SaveArgs = parse(args)?;
                 let path = self.output_path(&a.path)?;
-                let bytes = self.engine.doc.to_json().map_err(|e| e.to_string())?;
-                crate::engine::write_design(&path, bytes.as_bytes(), a.overwrite)?;
+                let bytes = self.engine.doc.to_file_bytes().map_err(|e| e.to_string())?;
+                crate::engine::write_design(&path, &bytes, a.overwrite)?;
                 self.dirty = false;
                 self.path = Some(path.clone());
                 Ok(json!({"path": path, "saved": true}))

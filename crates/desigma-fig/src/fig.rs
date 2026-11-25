@@ -1434,6 +1434,36 @@ mod tests {
         assert_eq!(legacy, streamed);
     }
 
+    /// Real-file check, run by hand like `real_file_matches_legacy_rest_tree`: the document
+    /// written in its file form (packed, for a design system) reads back equal.
+    #[test]
+    #[ignore]
+    fn real_file_survives_the_file_form() {
+        use std::hash::Hasher;
+        struct H(std::collections::hash_map::DefaultHasher);
+        impl std::io::Write for H {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.write(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        fn digest(doc: &Document) -> u64 {
+            let mut h = H(Default::default());
+            serde_json::to_writer(&mut h, doc).unwrap();
+            h.0.finish()
+        }
+        let path = std::env::var("FIG_FILE").expect("set FIG_FILE to a .fig path");
+        let doc = import_fig(&std::fs::read(path).unwrap()).unwrap();
+        let bytes = doc.to_file_bytes().unwrap();
+        println!("nodes {} -> {} bytes, packed: {}", doc.nodes.len(), bytes.len(), bytes.starts_with(&[0x1f, 0x8b]));
+        let back = Document::from_file_bytes(&bytes).unwrap();
+        assert_eq!((back.nodes.len(), back.pages.len(), back.images.len()), (doc.nodes.len(), doc.pages.len(), doc.images.len()));
+        assert_eq!(digest(&doc), digest(&back));
+    }
+
     #[test]
     fn blob_decoding_is_tolerant() {
         let mut b = vec![1u8];

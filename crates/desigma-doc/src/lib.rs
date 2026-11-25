@@ -18,6 +18,7 @@ mod library;
 mod library_ops;
 pub mod motion;
 mod node;
+mod pack;
 mod paint;
 mod prototype;
 mod session;
@@ -42,6 +43,7 @@ pub use library::*;
 pub use library_ops::*;
 pub use motion::{NodeMotion, TimelineSettings};
 pub use node::*;
+pub use pack::{MAX_UNPACKED_BYTES, PACK_ABOVE_NODES};
 pub use paint::*;
 pub use prototype::*;
 pub use session::*;
@@ -409,10 +411,14 @@ impl Document {
     /// Parses a native document. Text written by older versions that emulated lists with
     /// literal bullet and "1. " prefixes is converted to real lists.
     pub fn from_json(s: &str) -> serde_json::Result<Self> {
-        let mut doc: Self = serde_json::from_str(s)?;
-        doc.migrate_text();
-        doc.normalize_motion();
-        Ok(doc)
+        Ok(serde_json::from_str::<Self>(s)?.finish_load())
+    }
+
+    /// What every loaded document goes through, whichever form it came from.
+    pub(crate) fn finish_load(mut self) -> Self {
+        self.migrate_text();
+        self.normalize_motion();
+        self
     }
 
     /// Restores animation invariants (sorted unique keyframes, valid clips) of every node, e.g.

@@ -160,7 +160,7 @@ impl Library {
         let _g = lock();
         let mut entries = self.read_index(file_id);
         let clean = |s: Option<String>| s.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let json = doc.to_json()?;
+        let bytes = doc.to_file_bytes()?;
         let on_disk_max = std::fs::read_dir(self.versions_dir(file_id))
             .map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str()?.strip_suffix(".desigma")?.parse::<u32>().ok()).max().unwrap_or(0))
             .unwrap_or(0);
@@ -168,8 +168,8 @@ impl Library {
             .map(|rd| rd.flatten().filter_map(|e| e.file_name().to_str()?.strip_prefix(&format!("{file_id}-v"))?.parse::<u32>().ok()).max().unwrap_or(0))
             .unwrap_or(0);
         let n = entries.iter().map(|e| e.n).max().unwrap_or(0).max(on_disk_max).max(trashed_max) + 1;
-        let v = FileVersion { n, label: clean(label), description: clean(description), auto, created: now, size: json.len() as u64 };
-        write_atomic(&self.version_path(file_id, n), json.as_bytes())?;
+        let v = FileVersion { n, label: clean(label), description: clean(description), auto, created: now, size: bytes.len() as u64 };
+        write_atomic(&self.version_path(file_id, n), &bytes)?;
         entries.push(v.clone());
         if auto {
             let doomed = retention(&entries, now);
@@ -194,14 +194,14 @@ impl Library {
     }
 
     pub fn load_version(&self, file_id: &str, n: u32) -> Result<Document> {
-        let text = std::fs::read_to_string(self.version_path(file_id, n)).map_err(|e| {
+        let bytes = std::fs::read(self.version_path(file_id, n)).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
                 LibraryError::NotFound(format!("version {n} of {file_id}"))
             } else {
                 e.into()
             }
         })?;
-        Ok(Document::from_json(&text)?)
+        Ok(Document::from_file_bytes(&bytes)?)
     }
 
     /// Gives a version a name and/or description (an empty name clears it).

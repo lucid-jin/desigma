@@ -219,9 +219,9 @@ impl Server {
 
     /// Writes the document now (temp file, then rename; rotating backups).
     pub fn save(&mut self) -> Result<(), String> {
-        let json = self.doc.to_json().map_err(|e| format!("cannot serialize: {e}"))?;
+        let bytes = self.doc.to_file_bytes().map_err(|e| format!("cannot serialize: {e}"))?;
         store::rotate_backups(&self.doc_path, self.cfg.backups, self.cfg.backup_every);
-        save_atomic(&self.doc_path, json.as_bytes())?;
+        save_atomic(&self.doc_path, &bytes)?;
         self.dirty = false;
         self.last_save = Instant::now();
         self.log(&format!("saved {}", self.doc_path.display()));

@@ -5,7 +5,7 @@ use super::{thumb, Home, Section};
 use crate::app::App;
 use desigma_doc::{Document, DocumentKind};
 use desigma_library::Library;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::path::PathBuf;
 
 /// Seconds without a document change before a library file is autosaved.
@@ -44,15 +44,22 @@ impl Autosave {
     }
 }
 
+/// Hash of a document's content, to tell whether it changed since it was saved. The document is
+/// streamed through the hasher, so no JSON text (or compressed copy) of it is built.
 pub(crate) fn doc_hash(doc: &Document) -> u64 {
-    json_hash(&doc.to_json().unwrap_or_default())
-}
-
-/// [`doc_hash`] of a document already serialized by [`Document::to_json`].
-fn json_hash(json: &str) -> u64 {
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    json.hash(&mut h);
-    h.finish()
+    struct Sink(std::collections::hash_map::DefaultHasher);
+    impl std::io::Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.write(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut sink = std::io::BufWriter::with_capacity(1 << 16, Sink(std::collections::hash_map::DefaultHasher::new()));
+    let _ = serde_json::to_writer(&mut sink, doc);
+    sink.into_inner().map_or(0, |s| s.0.finish())
 }
 
 impl App {
@@ -207,7 +214,8 @@ impl App {
     }
 
     /// [`Self::save_library_file`]; with `only_changes` a document identical to the saved one is
-    /// not rewritten. The document is serialized once, for both the comparison and the write.
+    /// not rewritten. The comparison streams the document through a hasher (no text is built); only
+    /// a changed document is serialized again, packed, for the write.
     /// Returns whether the file was written.
     fn write_library_file(&mut self, only_changes: bool) -> Result<bool, String> {
         crate::decks::ui::flush_notes(self);
@@ -216,13 +224,13 @@ impl App {
             // an old version is on screen: the file on disk must keep the live document
             return Err("Go back to the current version before saving".into());
         }
-        let json = self.doc.to_json().map_err(|e| format!("Cannot save: {e}"))?;
-        let hash = json_hash(&json);
+        let hash = doc_hash(&self.doc);
         if only_changes && hash == self.autosave.saved_hash {
             self.autosave.changed_at = None;
             return Ok(false);
         }
-        lib.save_file_json(&lf.id, &json).map_err(|e| format!("Cannot save: {e}"))?;
+        let bytes = self.doc.to_file_bytes().map_err(|e| format!("Cannot save: {e}"))?;
+        lib.save_file_bytes(&lf.id, &bytes).map_err(|e| format!("Cannot save: {e}"))?;
         self.autosave.saved_hash = hash;
         self.autosave.changed_at = None;
         thumb::refresh_in_background(lib, lf.id, self.export_doc().into_owned());
@@ -416,8 +424,8 @@ fn write_shared(root: &std::path::Path, doc: &Document, source: &std::path::Path
     let dir = root.join(desigma_library::SHARED_DIR);
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let path = dir.join(format!("{}.desigma", shared_file_name(&doc.name, source)));
-    let json = doc.to_json().map_err(|e| e.to_string())?;
-    desigma_library::write_atomic(&path, json.as_bytes()).map_err(|e| e.to_string())
+    let bytes = doc.to_file_bytes().map_err(|e| e.to_string())?;
+    desigma_library::write_atomic(&path, &bytes).map_err(|e| e.to_string())
 }
 
 #[cfg(test)]

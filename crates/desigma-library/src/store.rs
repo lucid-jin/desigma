@@ -126,7 +126,9 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> Result<()> {
 
 /// Largest file `load_external` accepts. One limit for every import entry point (the editor,
 /// the MCP server), so they cannot drift apart. Node counts and decompressed sizes are bounded
-/// separately, while the import runs.
+/// separately, while the import runs.  A packed `.desigma` (see
+/// `Document::to_file_bytes`) counts by its size on disk; what it unpacks to is capped by
+/// `desigma_doc::MAX_UNPACKED_BYTES`.
 pub const MAX_IMPORT_BYTES: u64 = 256 * 1024 * 1024;
 
 /// Loads a document from any importable file: `.desigma` / `.json` (native or
@@ -160,7 +162,7 @@ pub fn load_external(path: &Path) -> Result<Document> {
                 Err(fig) => Document::from_json(&text).map_err(|e| invalid(format!("Not a Figma REST file ({fig}) nor a desigma file ({e})")))?,
             }
         }
-        _ => Document::from_json(&std::fs::read_to_string(path)?).map_err(|e| invalid(format!("Invalid desigma file: {e}")))?,
+        _ => Document::from_file_bytes(&std::fs::read(path)?).map_err(|e| invalid(format!("Invalid desigma file: {e}")))?,
     };
     if doc.name.is_empty() {
         doc.name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("Untitled").to_string();
@@ -379,7 +381,7 @@ impl Library {
             starred: false,
             thumbnail: None,
         };
-        write_atomic(&self.file_path(project, &entry.id), doc.to_json()?.as_bytes())?;
+        write_atomic(&self.file_path(project, &entry.id), &doc.to_file_bytes()?)?;
         m.files.push(entry.clone());
         m.project.modified = now;
         self.save_manifest(&m)?;
@@ -388,14 +390,14 @@ impl Library {
 
     /// Overwrites the file's contents atomically and bumps its modified time.
     pub fn save_file(&self, id: &str, doc: &Document) -> Result<()> {
-        self.save_file_json(id, &doc.to_json()?)
+        self.save_file_bytes(id, &doc.to_file_bytes()?)
     }
 
-    /// [`Self::save_file`] with the document already serialized by [`Document::to_json`].
-    pub fn save_file_json(&self, id: &str, json: &str) -> Result<()> {
+    /// [`Self::save_file`] with the document already serialized by [`Document::to_file_bytes`].
+    pub fn save_file_bytes(&self, id: &str, bytes: &[u8]) -> Result<()> {
         let _guard = write_lock();
         let (mut m, i) = self.find_file(id)?;
-        write_atomic(&self.file_path(&m.project.id, id), json.as_bytes())?;
+        write_atomic(&self.file_path(&m.project.id, id), bytes)?;
         let now = now_ms();
         m.files[i].modified = now;
         m.project.modified = now;
@@ -406,20 +408,14 @@ impl Library {
     /// has no field for it). Parses the file without building a document, so it is cheap enough
     /// to call once per file while listing.
     pub fn file_kind(&self, id: &str) -> Result<DocumentKind> {
-        #[derive(Deserialize)]
-        struct Probe {
-            #[serde(default)]
-            kind: DocumentKind,
-        }
         let (m, _) = self.find_file(id)?;
         let bytes = std::fs::read(self.file_path(&m.project.id, id))?;
-        Ok(serde_json::from_slice::<Probe>(&bytes)?.kind)
+        Ok(Document::file_kind(&bytes)?)
     }
 
     pub fn load_file(&self, id: &str) -> Result<Document> {
         let (m, _) = self.find_file(id)?;
-        let text = std::fs::read_to_string(self.file_path(&m.project.id, id))?;
-        Ok(Document::from_json(&text)?)
+        Ok(Document::from_file_bytes(&std::fs::read(self.file_path(&m.project.id, id))?)?)
     }
 
     fn update_file(&self, id: &str, f: impl FnOnce(&mut FileEntry)) -> Result<()> {
@@ -932,6 +928,29 @@ mod tests {
         std::fs::write(&bad, "nope").unwrap();
         assert!(lib.import_file(&bad, &p.id, None).is_err());
         assert_eq!(lib.all_files().len(), 2, "failed imports leave nothing behind");
+    }
+
+    #[test]
+    fn a_large_document_is_stored_packed_and_comes_back_whole() {
+        let (t, lib) = Tmp::new();
+        let p = lib.create_project("P").unwrap();
+        let mut big = doc("Big", desigma_doc::PACK_ABOVE_NODES + 1);
+        big.kind = desigma_doc::DocumentKind::Board;
+        let e = lib.create_file(&p.id, None, "Big", &big).unwrap();
+        let path = lib.file_path(&p.id, &e.id);
+        assert!(std::fs::read(&path).unwrap().starts_with(&[0x1f, 0x8b]), "large documents are gzip-packed on disk");
+        assert!(std::fs::metadata(&path).unwrap().len() < 1 << 20, "and far smaller than their JSON");
+        assert_eq!(lib.load_file(&e.id).unwrap().nodes.len(), big.nodes.len());
+        assert_eq!(lib.file_kind(&e.id).unwrap(), desigma_doc::DocumentKind::Board);
+        // saving again, and reading it as an external file, work the same way
+        lib.save_file(&e.id, &big).unwrap();
+        let copy = t.0.join("copy.desigma");
+        std::fs::copy(&path, &copy).unwrap();
+        assert_eq!(load_external(&copy).unwrap().nodes.len(), big.nodes.len());
+        // a plain file written by an older version still opens
+        let old = t.0.join("old.desigma");
+        std::fs::write(&old, doc("Old", 2).to_json().unwrap()).unwrap();
+        assert_eq!(load_external(&old).unwrap().nodes.len(), 3);
     }
 
     #[test]
