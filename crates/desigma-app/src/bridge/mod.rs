@@ -130,6 +130,43 @@ fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, String> {
 
 const UNSAVED: &str = "Unsaved changes in the editor: ask the user to save them first (discard_changes=true throws them away)";
 
+fn validate_bridge_open_path(path: &std::path::Path) -> Result<(), String> {
+    if path.is_absolute() {
+        Ok(())
+    } else {
+        Err(engine::generic_import_rejection_guidance("Open path must be absolute".into()))
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeOpenRoute {
+    LimitedImporter,
+    LegacyLoader,
+}
+
+fn bridge_open_route(path: &std::path::Path, picked_frames: bool) -> BridgeOpenRoute {
+    let is_fig = path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| ext.eq_ignore_ascii_case("fig"));
+    if picked_frames || is_fig {
+        BridgeOpenRoute::LimitedImporter
+    } else {
+        BridgeOpenRoute::LegacyLoader
+    }
+}
+
+/// Full and frame-selected FIG opens use desigma-library's import limits. Other
+/// formats retain the editor's legacy loader to avoid changing normal opens.
+/// Exact 256 MiB, stored-node, and expanded-node boundary contracts remain
+/// owned by desigma-library; the bridge only guarantees routing through it.
+fn load_bridge_document(path: &std::path::Path, frames: Option<&BTreeSet<String>>) -> Result<Document, String> {
+    match bridge_open_route(path, frames.is_some()) {
+        BridgeOpenRoute::LimitedImporter => {
+            let options = desigma_library::ImportOptions { only_frames: frames.cloned() };
+            crate::io::load_path_with(path, &options)
+        }
+        BridgeOpenRoute::LegacyLoader => crate::io::load_path(path),
+    }
+}
+
 /// Bridge-only calls that change the editor, beside the engine's [`engine::EDIT_TOOLS`].
 const MUTATING: &[&str] = &["desigma_select_nodes", "desigma_open_file", "desigma_save_file", "desigma_new_document"];
 
@@ -265,16 +302,16 @@ impl App {
                 if self.hist.can_undo() && !a.discard_changes {
                     return Err(UNSAVED.into());
                 }
-                if !a.path.is_absolute() {
-                    return Err("Open path must be absolute".into());
+                validate_bridge_open_path(&a.path)?;
+                let doc = load_bridge_document(&a.path, a.frames.as_ref()).map_err(|error| engine::import_rejection_guidance(&a.path, error))?;
+                match engine::validate_opened_document(&doc) {
+                    Ok(()) => {}
+                    Err(engine::OpenedDocumentError::LayerLimit(error)) => {
+                        drop(doc);
+                        return Err(engine::import_rejection_guidance(&a.path, error));
+                    }
+                    Err(engine::OpenedDocumentError::Invalid(error)) => return Err(error),
                 }
-                let doc = if let Some(frames) = &a.frames {
-                    let options = desigma_library::ImportOptions { only_frames: Some(frames.clone()) };
-                    crate::io::load_path_with(&a.path, &options)?
-                } else {
-                    crate::io::load_path(&a.path)?
-                };
-                engine::validate_opened_document(&doc, a.frames.is_some())?;
                 self.replace_document(doc, Some(a.path));
                 let mut result = self.bridge_document(json!({}))?;
                 if let Some(frames) = a.frames {
@@ -318,5 +355,38 @@ impl App {
         v["path"] = json!(self.file_path);
         v["has_undo"] = json!(self.hist.can_undo());
         Ok(v)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn non_absolute_open_path_keeps_error_first_and_adds_generic_guidance() {
+        let error = validate_bridge_open_path(std::path::Path::new("relative.fig")).unwrap_err();
+        assert!(error.starts_with("Open path must be absolute\n\nImport recovery:"), "{error}");
+        assert!(!error.contains("Heaviest public frames:"), "path validation must not try to outline a file: {error}");
+    }
+
+    #[test]
+    fn full_fig_uses_limited_importer_but_non_fig_keeps_legacy_loader() {
+        assert_eq!(bridge_open_route(std::path::Path::new("large.fig"), false), BridgeOpenRoute::LimitedImporter);
+        assert_eq!(bridge_open_route(std::path::Path::new("normal.pen"), false), BridgeOpenRoute::LegacyLoader);
+        assert_eq!(bridge_open_route(std::path::Path::new("normal.desigma"), false), BridgeOpenRoute::LegacyLoader);
+        assert_eq!(bridge_open_route(std::path::Path::new("selected.fig"), true), BridgeOpenRoute::LimitedImporter);
+    }
+
+    #[test]
+    fn full_fig_bridge_preserves_library_size_rejection_and_adds_guidance() {
+        let path = std::env::temp_dir().join(format!("desigma-bridge-size-limit-{}.fig", std::process::id()));
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(desigma_library::MAX_IMPORT_BYTES + 1).unwrap();
+        drop(file);
+
+        let error = load_bridge_document(&path, None).map_err(|error| engine::import_rejection_guidance(&path, error)).unwrap_err();
+        let original = format!("Cannot import design: Input file exceeds the {} MiB import limit", desigma_library::MAX_IMPORT_BYTES >> 20);
+        assert!(error.starts_with(&format!("{original}\n\nImport recovery:")), "{error}");
+        std::fs::remove_file(path).ok();
     }
 }

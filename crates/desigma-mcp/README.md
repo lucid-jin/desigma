@@ -77,7 +77,7 @@ Imports are limited to 256 MiB per file, 100,000 layers (the hidden library page
 | --- | --- |
 | `desigma_list_files` | Design files in this user's library, plus `shared/` copies of files opened from outside it while the agent bridge is on. Each `path` is valid for `desigma_open_file`. |
 | `desigma_inspect_file` | Inspect a `.fig` without importing it; returns stored totals and pages/top-level frames with node and image weights. Hidden library pages are marked `internal: true`. |
-| `desigma_open_file` | Import a native `.desigma`, `.fig`, `.pen` (Pencil), SVG, or supported JSON design into the session. For `.fig`, `only_frames` imports selected top-level frames plus transitive dependencies. |
+| `desigma_open_file` | Import a native `.desigma`, `.fig`, `.pen` (Pencil), SVG, or supported JSON design into the session. For `.fig`, `frames` imports selected top-level frames plus transitive dependencies. |
 | `desigma_new_document` | Start an empty document with one page. |
 | `desigma_save_file` | Write the session to a native `.desigma` file: a new one, or an existing one with `overwrite: true`. |
 | `desigma_get_document` | Read document name, pages, counts, undo/redo availability, and `session` (`"file"` or `"editor"`). |

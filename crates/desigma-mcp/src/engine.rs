@@ -3,6 +3,7 @@ use desigma_doc::{Color, Command, Document, History, LineHeight, Node, NodeId, N
 use desigma_svg::ImportOptions;
 use serde::{de::DeserializeOwned, Deserialize};
 use serde_json::{json, Value};
+use std::path::Path;
 
 pub struct Engine {
     pub doc: Document,
@@ -223,25 +224,111 @@ pub fn validate_document(doc: &Document) -> Result<(), String> {
     validate_document_with_limit(doc, MAX_LAYERS)
 }
 
-/// Validates an imported document and, for a frame-picked import, explains how
-/// to recover from the editable-layer limit without retrying the whole file.
-pub fn validate_opened_document(doc: &Document, picked_frames: bool) -> Result<(), String> {
-    validate_document(doc).map_err(|error| add_frame_pick_guidance(error, picked_frames))
+/// A structural validation failure from an opened document. Callers can add
+/// import guidance only for the layer limit without comparing error strings.
+#[derive(Debug, PartialEq, Eq)]
+pub enum OpenedDocumentError {
+    LayerLimit(String),
+    Invalid(String),
 }
 
-fn add_frame_pick_guidance(error: String, picked_frames: bool) -> String {
-    if picked_frames && error == format!("Document exceeds the {MAX_LAYERS} layer limit") {
-        format!("{error}. Pick fewer frames and try again; use desigma_inspect_file to compare each top-level frame's nodes and image_bytes")
-    } else {
-        error
+/// Validates an imported document and returns the original validation message.
+pub fn validate_opened_document(doc: &Document) -> Result<(), OpenedDocumentError> {
+    validate_opened_document_with_limit(doc, MAX_LAYERS)
+}
+
+/// The same open-path validation with an injectable limit, so the real import
+/// path can be covered without manufacturing a 100,000-layer fixture.
+pub fn validate_opened_document_with_limit(doc: &Document, max_layers: usize) -> Result<(), OpenedDocumentError> {
+    if editable_layer_count(doc) > max_layers {
+        return Err(OpenedDocumentError::LayerLimit(format!("Document exceeds the {max_layers} layer limit")));
     }
+    validate_document_with_limit(doc, max_layers).map_err(OpenedDocumentError::Invalid)
+}
+
+fn editable_layer_count(doc: &Document) -> usize {
+    doc.nodes.len().saturating_sub(desigma_doc::library_node_count(doc))
+}
+
+/// Keeps an importer's original rejection verbatim and appends actionable
+/// recovery help. Both the file session and editor bridge use this one builder.
+pub fn import_rejection_guidance(source: &Path, error: String) -> String {
+    import_rejection_guidance_impl(Some(source), error)
+}
+
+/// Recovery text for errors that happen before there is a readable input file
+/// to inspect (path resolution, extension checks, and equivalent bridge errors).
+pub fn generic_import_rejection_guidance(error: String) -> String {
+    import_rejection_guidance_impl(None, error)
+}
+
+fn panic_safe_outline(load: impl FnOnce() -> desigma_library::Result<desigma_library::FigOutline>) -> Option<desigma_library::FigOutline> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(load)).ok()?.ok()
+}
+
+fn inspect_outline_safely(source: &Path) -> Option<desigma_library::FigOutline> {
+    panic_safe_outline(|| desigma_library::inspect_external(source))
+}
+
+const OUTLINE_LABEL_CHARS: usize = 120;
+
+fn sanitize_outline_label(label: &str) -> String {
+    let mut sanitized = String::new();
+    let mut displayed = 0;
+    let mut truncated = false;
+    for ch in label.chars() {
+        let escaped = if ch.is_control() { ch.escape_default().collect::<String>() } else { ch.to_string() };
+        let escaped_len = escaped.chars().count();
+        if displayed + escaped_len > OUTLINE_LABEL_CHARS {
+            truncated = true;
+            break;
+        }
+        sanitized.push_str(&escaped);
+        displayed += escaped_len;
+    }
+    if truncated {
+        while displayed >= OUTLINE_LABEL_CHARS {
+            sanitized.pop();
+            displayed -= 1;
+        }
+        sanitized.push('…');
+    }
+    sanitized
+}
+
+fn import_rejection_guidance_impl(source: Option<&Path>, error: String) -> String {
+    let mut guidance = String::from(
+        "Import recovery: split file by template; delete duplicate frames; Flatten artwork that does not need editing. Partial import is possible with desigma_open_file `frames`; use desigma_inspect_file to inspect top-level frame weights.",
+    );
+    if let Some(outline) = source.and_then(inspect_outline_safely) {
+        let mut frames: Vec<_> = outline.pages.iter().filter(|page| !page.internal).flat_map(|page| &page.frames).collect();
+        frames.sort_by(|a, b| compare_frame_rank(a.image_bytes, a.nodes, &a.id, b.image_bytes, b.nodes, &b.id));
+        if !frames.is_empty() {
+            guidance.push_str("\nHeaviest public frames:");
+            for frame in frames.into_iter().take(3) {
+                guidance.push_str(&format!(
+                    "\n- {} (id {}, {} nodes, {:.2} MiB images)",
+                    sanitize_outline_label(&frame.name),
+                    sanitize_outline_label(&frame.id),
+                    frame.nodes,
+                    frame.image_bytes as f64 / 1_048_576.0
+                ));
+            }
+        }
+    }
+    format!("{error}\n\n{guidance}")
+}
+
+/// Heavy frames rank first; stable, deterministic ties use the frame ID.
+pub fn compare_frame_rank(a_images: u64, a_nodes: usize, a_id: &str, b_images: u64, b_nodes: usize, b_id: &str) -> std::cmp::Ordering {
+    b_images.cmp(&a_images).then_with(|| b_nodes.cmp(&a_nodes)).then_with(|| a_id.cmp(b_id))
 }
 
 fn validate_document_with_limit(doc: &Document, max_layers: usize) -> Result<(), String> {
     use std::collections::BTreeSet;
     // The hidden library page holds non-editable copies of library components; the limit is on
     // the layers an agent or user can actually work with.
-    if doc.nodes.len().saturating_sub(desigma_doc::library_node_count(doc)) > max_layers {
+    if editable_layer_count(doc) > max_layers {
         return Err(format!("Document exceeds the {max_layers} layer limit"));
     }
     for (id, node) in &doc.nodes {
@@ -980,15 +1067,104 @@ mod tests {
     }
 
     #[test]
+    fn frame_rank_ties_break_by_images_then_nodes_then_id() {
+        use desigma_fig::OutlineFrame;
+        let mut frames = [
+            OutlineFrame { id: "2:2".into(), name: "id-later".into(), kind: "FRAME".into(), nodes: 8, image_bytes: 100 },
+            OutlineFrame { id: "1:9".into(), name: "fewer-nodes".into(), kind: "FRAME".into(), nodes: 7, image_bytes: 100 },
+            OutlineFrame { id: "1:2".into(), name: "id-earlier".into(), kind: "FRAME".into(), nodes: 8, image_bytes: 100 },
+            OutlineFrame { id: "9:9".into(), name: "more-images".into(), kind: "FRAME".into(), nodes: 1, image_bytes: 101 },
+        ];
+        frames.sort_by(|a, b| compare_frame_rank(a.image_bytes, a.nodes, &a.id, b.image_bytes, b.nodes, &b.id));
+        assert_eq!(frames.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(), ["more-images", "id-earlier", "id-later", "fewer-nodes"]);
+    }
+
+    #[test]
+    fn outline_panics_are_suppressed_for_rejection_guidance() {
+        let outline = panic_safe_outline(|| -> desigma_library::Result<desigma_library::FigOutline> { panic!("malformed outline parser") });
+        assert!(outline.is_none());
+    }
+
+    #[test]
+    fn outline_labels_escape_controls_and_have_a_unicode_safe_display_cap() {
+        assert_eq!(sanitize_outline_label("bad\nname\t\u{7}"), "bad\\nname\\t\\u{7}");
+        let label = sanitize_outline_label(&"界".repeat(121));
+        assert_eq!(label.chars().count(), 120);
+        assert!(label.ends_with('…'));
+        assert!(std::str::from_utf8(label.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn layer_limit_validation_is_structural_and_returns_bare_error() {
+        let err = validate_opened_document_with_limit(&doc_with(2, 0), 1).unwrap_err();
+        assert!(matches!(
+            err,
+            OpenedDocumentError::LayerLimit(ref message)
+                if message == "Document exceeds the 1 layer limit"
+        ));
+    }
+
+    #[test]
     fn picked_frame_layer_limit_explains_how_to_retry() {
+        let dir = std::env::temp_dir().join(format!("desigma-guidance-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("frames.fig");
+        std::fs::write(&path, desigma_fig::testkit::frames_fig()).unwrap();
         let base = format!("Document exceeds the {MAX_LAYERS} layer limit");
-        let guided = add_frame_pick_guidance(base.clone(), true);
-        assert_eq!(
-            guided,
-            format!("{base}. Pick fewer frames and try again; use desigma_inspect_file to compare each top-level frame's nodes and image_bytes")
-        );
-        assert_eq!(add_frame_pick_guidance(base.clone(), false), base);
-        assert_eq!(add_frame_pick_guidance("other".into(), true), "other");
+        let guided = import_rejection_guidance(&path, base.clone());
+        assert!(guided.starts_with(&base), "the original error must remain first: {guided}");
+        for concept in [
+            "split file by template",
+            "delete duplicate frames",
+            "Flatten artwork that does not need editing",
+            "desigma_open_file `frames`",
+            "desigma_inspect_file",
+        ] {
+            assert!(guided.contains(concept), "missing {concept:?}: {guided}");
+        }
+        for frame in ["Other", "Footer", "Hero"] {
+            assert!(guided.contains(frame), "missing heaviest public frame {frame}: {guided}");
+        }
+        let listed: Vec<_> = guided.lines().filter(|line| line.starts_with("- ")).collect();
+        assert_eq!(listed.len(), 3, "only the three heaviest frames are listed: {guided}");
+        assert!(listed[0].contains("Other") && listed[1].contains("Footer") && listed[2].contains("Hero"), "wrong ranking: {guided}");
+        assert!(!guided.contains("LibUnused"), "internal frames must be excluded: {guided}");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn full_open_layer_limit_gets_the_same_recovery_guidance() {
+        let path = std::env::temp_dir().join(format!("desigma-guidance-full-{}.fig", std::process::id()));
+        std::fs::write(&path, desigma_fig::testkit::frames_fig()).unwrap();
+        let original = format!("Document exceeds the {MAX_LAYERS} layer limit");
+        let guided = import_rejection_guidance(&path, original.clone());
+        assert!(guided.starts_with(&original));
+        assert!(guided.contains("desigma_open_file `frames`"), "{guided}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn non_fig_rejection_gets_guidance_without_a_frame_list() {
+        let path = std::env::temp_dir().join(format!("desigma-guidance-{}.desigma", std::process::id()));
+        std::fs::write(&path, b"not a fig").unwrap();
+        let original = "Document exceeds the 100000 layer limit".to_string();
+        let guided = import_rejection_guidance(&path, original.clone());
+        assert!(guided.starts_with(&original));
+        assert!(guided.contains("split file by template"), "{guided}");
+        assert!(!guided.contains("Heaviest public frames"), "{guided}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn outline_failure_preserves_the_original_error_verbatim() {
+        let path = std::env::temp_dir().join(format!("desigma-guidance-broken-{}.fig", std::process::id()));
+        std::fs::write(&path, b"broken fig").unwrap();
+        let original = "Cannot import design: the file stores 150001 nodes; limit is 150000".to_string();
+        let guided = import_rejection_guidance(&path, original.clone());
+        assert!(guided.starts_with(&format!("{original}\n")), "{guided}");
+        assert!(guided.contains("desigma_inspect_file"), "{guided}");
+        assert!(!guided.contains("Heaviest public frames"), "{guided}");
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

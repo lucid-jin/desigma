@@ -24,6 +24,9 @@ pub struct Session {
     mode: Option<Mode>,
     /// The `.desigma` file this session was opened from or last saved to, if any.
     path: Option<PathBuf>,
+    /// Production uses MAX_LAYERS; tests lower this to exercise the complete
+    /// import and validation path with small, realistic fixtures.
+    open_layer_limit: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -85,11 +88,16 @@ impl Session {
     /// for a running editor). Tests use this to avoid ever touching a real
     /// developer's editor, which the default `new` would otherwise do.
     pub fn with_discovery(root: &Path, discovery: Option<PathBuf>) -> Result<Self, String> {
+        Self::with_discovery_and_open_layer_limit(root, discovery, crate::engine::MAX_LAYERS)
+    }
+
+    #[doc(hidden)]
+    pub fn with_discovery_and_open_layer_limit(root: &Path, discovery: Option<PathBuf>, open_layer_limit: usize) -> Result<Self, String> {
         let root = root.canonicalize().map_err(|e| format!("Cannot open workspace: {e}"))?;
         if !root.is_dir() {
             return Err("Workspace must be a directory".into());
         }
-        Ok(Self { engine: Engine::default(), root, dirty: false, discovery, mode: None, path: None })
+        Ok(Self { engine: Engine::default(), root, dirty: false, discovery, mode: None, path: None, open_layer_limit })
     }
 
     fn input_path(&self, path: &str) -> Result<PathBuf, String> {
@@ -224,7 +232,10 @@ impl Session {
         if name == "desigma_inspect_file" {
             let a: InspectArgs = parse(args)?;
             let path = self.input_path(&a.path)?;
-            let outline = desigma_library::inspect_external(&path).map_err(|e| format!("Cannot inspect design: {e}"))?;
+            let mut outline = desigma_library::inspect_external(&path).map_err(|e| format!("Cannot inspect design: {e}"))?;
+            for page in &mut outline.pages {
+                page.frames.sort_by(|a, b| crate::engine::compare_frame_rank(a.image_bytes, a.nodes, &a.id, b.image_bytes, b.nodes, &b.id));
+            }
             return serde_json::to_value(outline).map_err(|e| format!("Cannot encode outline: {e}"));
         }
         if name == "desigma_import_svg" {
@@ -254,10 +265,18 @@ impl Session {
                 if self.dirty && !a.discard_changes {
                     return Err("Unsaved changes: save to a new .desigma file, or set discard_changes=true".into());
                 }
-                let path = self.input_path(&a.path)?;
+                let path = self.input_path(&a.path).map_err(crate::engine::generic_import_rejection_guidance)?;
                 let options = desigma_library::ImportOptions { only_frames: a.frames.clone() };
-                let doc = desigma_library::load_external_with(&path, &options).map_err(|e| format!("Cannot import design: {e}"))?;
-                crate::engine::validate_opened_document(&doc, a.frames.is_some())?;
+                let doc = desigma_library::load_external_with(&path, &options)
+                    .map_err(|e| crate::engine::import_rejection_guidance(&path, format!("Cannot import design: {e}")))?;
+                match crate::engine::validate_opened_document_with_limit(&doc, self.open_layer_limit) {
+                    Ok(()) => {}
+                    Err(crate::engine::OpenedDocumentError::LayerLimit(error)) => {
+                        drop(doc);
+                        return Err(crate::engine::import_rejection_guidance(&path, error));
+                    }
+                    Err(crate::engine::OpenedDocumentError::Invalid(error)) => return Err(error),
+                }
                 self.engine = Engine::default();
                 self.engine.doc = doc;
                 self.dirty = false;
@@ -322,7 +341,7 @@ impl Session {
         match name {
             "desigma_open_file" => {
                 let a: OpenArgs = parse(args.clone())?;
-                args["path"] = json!(self.input_path(&a.path)?);
+                args["path"] = json!(self.input_path(&a.path).map_err(crate::engine::generic_import_rejection_guidance)?);
             }
             "desigma_save_file" => {
                 let a: SaveArgs = parse(args.clone())?;

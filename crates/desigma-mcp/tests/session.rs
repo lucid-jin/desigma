@@ -51,8 +51,10 @@ fn fig_outline_and_frame_selection_keep_the_public_contract() {
     assert_eq!((outline["stored_nodes"].as_u64(), outline["image_count"].as_u64(), outline["image_bytes"].as_u64()), (Some(19), Some(4), Some(15_000)));
     assert_eq!(outline["pages"][0]["internal"], false);
     assert_eq!(outline["pages"][2]["internal"], true, "hidden library pages stay visibly marked");
+    let landing: Vec<_> = outline["pages"][0]["frames"].as_array().unwrap().iter().map(|frame| frame["name"].as_str().unwrap()).collect();
+    assert_eq!(landing, ["Footer", "Hero", "Empty"], "frames are heaviest first within their page");
 
-    let empty = outline["pages"][0]["frames"][2]["id"].as_str().unwrap();
+    let empty = outline["pages"][0]["frames"].as_array().unwrap().iter().find(|frame| frame["name"] == "Empty").unwrap()["id"].as_str().unwrap();
     let opened = s.call("desigma_open_file", json!({"path":"frames.fig","frames":[empty]})).unwrap();
     assert_eq!(opened["selected_frame_count"], 1);
     assert!(opened["selection_note"].as_str().unwrap().contains("dependencies"));
@@ -68,6 +70,61 @@ fn fig_outline_and_frame_selection_keep_the_public_contract() {
     assert!(err.contains("Only .fig files have an outline"), "{err}");
 }
 
+fn assert_generic_import_guidance(error: &str, original_start: &str) {
+    assert!(error.starts_with(original_start), "original error must stay first: {error}");
+    assert!(error.contains("Import recovery:"), "missing recovery guidance: {error}");
+    assert!(error.contains("desigma_open_file `frames`"), "missing frame recovery option: {error}");
+}
+
+fn assert_original_then_guidance(error: &str, original: &str) {
+    assert!(error.starts_with(&format!("{original}\n\nImport recovery:")), "original error was changed or displaced: {error}");
+}
+
+#[test]
+fn real_open_paths_guide_full_and_selected_fig_layer_excess() {
+    let dir = Workspace::new();
+    fs::write(dir.0.join("frames.fig"), desigma_fig::testkit::frames_fig()).unwrap();
+
+    let mut full = Session::with_discovery_and_open_layer_limit(&dir.0, None, 1).unwrap();
+    let error = full.call("desigma_open_file", json!({"path":"frames.fig"})).unwrap_err();
+    assert_generic_import_guidance(&error, "Document exceeds the 1 layer limit");
+    assert!(error.contains("Heaviest public frames:"), "real FIG outline should be included: {error}");
+
+    let mut selected = Session::with_discovery_and_open_layer_limit(&dir.0, None, 1).unwrap();
+    let error = selected.call("desigma_open_file", json!({"path":"frames.fig","frames":["3:1"]})).unwrap_err();
+    assert_generic_import_guidance(&error, "Document exceeds the 1 layer limit");
+    assert!(error.contains("Heaviest public frames:"), "real selected-frame validation should retain the FIG outline: {error}");
+}
+
+#[test]
+fn real_open_failures_keep_the_original_error_and_add_generic_guidance() {
+    let dir = Workspace::new();
+    fs::write(dir.0.join("plain.desigma"), desigma_doc::Document::new("plain").to_file_bytes().unwrap()).unwrap();
+    fs::write(dir.0.join("broken.desigma"), b"not a design").unwrap();
+    fs::write(dir.0.join("broken.fig"), b"not a fig").unwrap();
+    let mut s = Session::with_discovery(&dir.0, None).unwrap();
+
+    let non_fig_frames = s.call("desigma_open_file", json!({"path":"plain.desigma","frames":["1:2"]})).unwrap_err();
+    let frame_options = desigma_library::ImportOptions { only_frames: Some(["1:2".to_string()].into()) };
+    let frame_original = format!("Cannot import design: {}", desigma_library::load_external_with(&dir.0.join("plain.desigma"), &frame_options).unwrap_err());
+    assert_original_then_guidance(&non_fig_frames, &frame_original);
+    assert!(!non_fig_frames.contains("Heaviest public frames:"), "non-FIG failures get no outline: {non_fig_frames}");
+
+    let non_fig_read = s.call("desigma_open_file", json!({"path":"broken.desigma"})).unwrap_err();
+    let non_fig_original = format!("Cannot import design: {}", desigma_library::load_external(&dir.0.join("broken.desigma")).unwrap_err());
+    assert_original_then_guidance(&non_fig_read, &non_fig_original);
+    assert!(!non_fig_read.contains("Heaviest public frames:"), "non-FIG failures get no outline: {non_fig_read}");
+
+    let broken_fig = s.call("desigma_open_file", json!({"path":"broken.fig"})).unwrap_err();
+    let fig_original = format!("Cannot import design: {}", desigma_library::load_external(&dir.0.join("broken.fig")).unwrap_err());
+    assert_original_then_guidance(&broken_fig, &fig_original);
+    assert!(!broken_fig.contains("Heaviest public frames:"), "failed outline must not replace the actual import error: {broken_fig}");
+
+    let missing = s.call("desigma_open_file", json!({"path":"missing.fig"})).unwrap_err();
+    assert_generic_import_guidance(&missing, "Cannot open path:");
+    assert!(!missing.contains("Heaviest public frames:"), "path failures get generic guidance only: {missing}");
+}
+
 #[test]
 fn saved_file_roundtrip_and_unsaved_changes_guard() {
     let dir = Workspace::new();
@@ -78,7 +135,10 @@ fn saved_file_roundtrip_and_unsaved_changes_guard() {
     assert!(s.call("desigma_new_document", json!({"name":"Oops"})).is_err());
     s.call("desigma_save_file", json!({"path":"first.desigma"})).unwrap();
     s.call("desigma_update_node", json!({"node_id":node["node"]["id"],"text":"Changed"})).unwrap();
-    assert!(s.call("desigma_open_file", json!({"path":"first.desigma"})).is_err());
+    assert_eq!(
+        s.call("desigma_open_file", json!({"path":"first.desigma"})).unwrap_err(),
+        "Unsaved changes: save to a new .desigma file, or set discard_changes=true"
+    );
     s.call("desigma_open_file", json!({"path":"first.desigma","discard_changes":true})).unwrap();
     assert_eq!(s.call("desigma_get_node", json!({"node_id":node["node"]["id"]})).unwrap()["node"], node["node"]);
     let original = fs::read(dir.0.join("first.desigma")).unwrap();
@@ -226,6 +286,9 @@ fn session_routes_to_the_editor_when_its_bridge_answers() {
     let mut s = Session::with_discovery(&dir.0, Some(file.clone())).unwrap();
     let v = s.call("desigma_get_document", json!({})).unwrap();
     assert_eq!(v["echo"], true); // answered by the fake editor, not the local engine
+    let open_error = s.call("desigma_open_file", json!({"path":"missing.fig"})).unwrap_err();
+    assert_generic_import_guidance(&open_error, "Cannot open path:"); // live forwarding validates and guides paths before contacting the editor
+    assert!(!open_error.contains("Heaviest public frames:"), "{open_error}");
     assert!(s.call("desigma_export_image", json!({"node_id":1,"path":"../x.png"})).is_err()); // workspace rule still applies
 
     let _ = fs::remove_file(&file);
