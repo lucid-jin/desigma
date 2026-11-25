@@ -21,8 +21,9 @@ struct Decoded {
 }
 
 fn decode(bytes: &[u8]) -> Result<Decoded, FigError> {
-    let archive = container::open(bytes)?;
+    let mut archive = container::open(bytes)?;
     let (schema_bin, msg_bin) = container::read_chunks(&archive.canvas)?;
+    archive.canvas = Vec::new(); // inflated into the message below; nothing reads it again
     let schema = Schema::decode(&schema_bin).map_err(|e| FigError::Format(format!("kiwi schema: {e}")))?;
     let root = schema.root_message().ok_or_else(|| FigError::Format("schema has no message definition".into()))?;
     let message = schema.decode_message(root, &msg_bin).map_err(|e| FigError::Format(format!("kiwi message: {e}")))?;
@@ -60,9 +61,11 @@ fn file_name(d: &Decoded) -> String {
 
 /// [`import_fig`] with [`ImportOptions`]: all of the file, or only the frames that were picked.
 pub fn import_fig_with(bytes: &[u8], opts: &ImportOptions) -> Result<Document, FigError> {
-    let d = decode(bytes)?;
+    let mut d = decode(bytes)?;
     check_stored(&d)?;
-    let mut doc = import_message_streaming_with(&d.message, &file_name(&d), opts.only_frames.as_ref())?;
+    let name = file_name(&d);
+    let mut doc = import_message_streaming_with(&mut d.message, &name, opts.only_frames.as_ref())?;
+    drop(d.message);
     doc.images = d.archive.images;
     if opts.only_frames.is_some() {
         // the frames left out take their images with them
@@ -75,15 +78,18 @@ pub fn import_fig_with(bytes: &[u8], opts: &ImportOptions) -> Result<Document, F
 /// Lists the pages of a `.fig` file and the top-level frames on each, with their weight, without
 /// importing it. See [`FigOutline`].
 pub fn outline_fig(bytes: &[u8]) -> Result<FigOutline, FigError> {
-    let d = decode(bytes)?;
+    let mut d = decode(bytes)?;
     check_stored(&d)?;
+    let nodes = take_nodes(&mut d.message);
     let blobs = blobs_of(&d.message);
-    let nodes = d.message.get("nodeChanges").and_then(KiwiValue::as_array).unwrap_or(&[]);
-    let entries = entries_of(nodes);
+    let entries = entries_of(&nodes);
+    let stored_nodes = nodes.len();
+    let nodes = std::cell::RefCell::new(nodes);
+    let nodes = &nodes;
     let tree = Tree::new(&entries);
     let lk = Lk::new(&entries, &blobs);
     let mut out = FigOutline {
-        stored_nodes: nodes.len(),
+        stored_nodes,
         image_count: d.archive.images.len(),
         image_bytes: d.archive.images.values().map(|v| v.len() as u64).sum(),
         ..Default::default()
@@ -126,7 +132,7 @@ pub fn outline_fig(bytes: &[u8]) -> Result<FigOutline, FigError> {
 /// A mask clips every sibling that follows it, which no id says: a unit also brings the masks
 /// that precede it on its page. Ids must be unique for any of this to mean one thing, so a file
 /// that repeats an id cannot be picked from.
-fn units_to_import(entries: &[Entry], nodes: Option<&[KiwiValue]>, tree: &Tree, only: &BTreeSet<String>) -> Result<HashSet<usize>, FigError> {
+fn units_to_import(entries: &[Entry], nodes: Option<&NodeStore>, tree: &Tree, only: &BTreeSet<String>) -> Result<HashSet<usize>, FigError> {
     let mut by_id: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
     for (i, e) in entries.iter().enumerate() {
         if by_id.insert(e.id.as_str(), i).is_some() {
@@ -507,13 +513,16 @@ impl Tree {
 
 #[cfg(test)]
 fn import_message_streaming(msg: &KiwiValue, name: &str) -> Result<Document, FigError> {
-    import_message_streaming_with(msg, name, None)
+    import_message_streaming_with(&mut msg.clone(), name, None)
 }
 
-fn import_message_streaming_with(msg: &KiwiValue, name: &str, only: Option<&BTreeSet<String>>) -> Result<Document, FigError> {
+/// Imports a decoded message. Its node list is taken out of it and let go of node by node.
+fn import_message_streaming_with(msg: &mut KiwiValue, name: &str, only: Option<&BTreeSet<String>>) -> Result<Document, FigError> {
+    let nodes = take_nodes(msg);
+    let entries = entries_of(&nodes);
+    let store = std::cell::RefCell::new(nodes);
     let blobs = blobs_of(msg);
-    let nodes = msg.get("nodeChanges").and_then(KiwiValue::as_array).unwrap_or(&[]);
-    import_entries_streaming(entries_of(nodes), Some(nodes), &blobs, name, only)
+    import_entries_streaming(entries, Some(&store), &blobs, name, only)
 }
 
 fn import_changes_streaming(changes: Vec<Value>, blobs: &[&[u8]], name: &str) -> Result<Document, FigError> {
@@ -521,17 +530,41 @@ fn import_changes_streaming(changes: Vec<Value>, blobs: &[&[u8]], name: &str) ->
     import_entries_streaming(entries, None, blobs, name, None)
 }
 
+/// The nodes of a decoded message, owned apart from the message so that a node can be let go of
+/// as soon as it has been converted: the message is the largest thing alive while a big file
+/// imports, and by the end of the import nearly none of it is needed any more.
+type NodeStore = std::cell::RefCell<Vec<KiwiValue>>;
+
+/// Moves the node list out of a decoded message (the blobs stay in it).
+fn take_nodes(msg: &mut KiwiValue) -> Vec<KiwiValue> {
+    match msg {
+        KiwiValue::Message(fields) | KiwiValue::Struct(fields) => fields
+            .iter_mut()
+            .find(|(name, _)| &**name == "nodeChanges")
+            .and_then(|(_, v)| if let KiwiValue::Array(a) = v { Some(std::mem::take(a)) } else { None })
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    }
+}
+
+/// Frees node `src` of the store. Its entry must not be read again.
+fn release_node(nodes: Option<&NodeStore>, src: usize) {
+    if let Some(store) = nodes {
+        store.borrow_mut()[src] = KiwiValue::Bool(false);
+    }
+}
+
 /// The JSON of entry `i`: the one it kept, or converted from the message on the spot.
-fn node_json<'a>(entries: &'a [Entry], nodes: Option<&[KiwiValue]>, i: usize) -> std::borrow::Cow<'a, Value> {
+fn node_json<'a>(entries: &'a [Entry], nodes: Option<&NodeStore>, i: usize) -> std::borrow::Cow<'a, Value> {
     match (&entries[i].json, nodes) {
-        (Value::Null, Some(n)) => std::borrow::Cow::Owned(kiwi::to_json(&n[entries[i].src])),
+        (Value::Null, Some(n)) => std::borrow::Cow::Owned(kiwi::to_json(&n.borrow()[entries[i].src])),
         (j, _) => std::borrow::Cow::Borrowed(j),
     }
 }
 
 fn import_entries_streaming(
     entries: Vec<Entry>,
-    nodes: Option<&[KiwiValue]>,
+    nodes: Option<&NodeStore>,
     blobs: &[&[u8]],
     name: &str,
     only: Option<&BTreeSet<String>>,
@@ -551,7 +584,7 @@ fn import_entries_streaming(
     /// What `stream_node` reads: the entries, the message they came from, the tree and the lookups.
     struct Walk<'w> {
         entries: &'w [Entry],
-        nodes: Option<&'w [KiwiValue]>,
+        nodes: Option<&'w NodeStore>,
         children: &'w HashMap<usize, Vec<usize>>,
         lk: &'w Lk<'w>,
     }
@@ -564,6 +597,7 @@ fn import_entries_streaming(
         let Some(node) = convert_node(&node_json(entries, w.nodes, i), &entries[i].id, w.lk).map(Value::Object) else { return };
         session.start_node(&node);
         drop(node); // descendants never overlap this converted REST node
+        release_node(w.nodes, entries[i].src);
         if let Some(kids) = w.children.get(&i) {
             let mut ordered = kids.clone();
             if entries[i].ty == "TABLE" && ordered.iter().all(|&child| entries[child].row.is_some() && entries[child].col.is_some()) {
