@@ -215,11 +215,20 @@ pub fn call<H: Host>(host: &mut H, name: &str, args: Value) -> Result<Value, Str
     }
 }
 
+/// Most layers a document may hold, not counting the hidden library page.
+pub const MAX_LAYERS: usize = 100_000;
+
 /// Reject broken graphs before recursive exporters or inherited-mode resolution use them.
 pub fn validate_document(doc: &Document) -> Result<(), String> {
+    validate_document_with_limit(doc, MAX_LAYERS)
+}
+
+fn validate_document_with_limit(doc: &Document, max_layers: usize) -> Result<(), String> {
     use std::collections::BTreeSet;
-    if doc.nodes.len() > 100_000 {
-        return Err("Document exceeds the 100000 layer limit".into());
+    // The hidden library page holds non-editable copies of library components; the limit is on
+    // the layers an agent or user can actually work with.
+    if doc.nodes.len().saturating_sub(desigma_doc::library_node_count(doc)) > max_layers {
+        return Err(format!("Document exceeds the {max_layers} layer limit"));
     }
     for (id, node) in &doc.nodes {
         if *id != node.id || id.0 == 0 {
@@ -931,6 +940,49 @@ pub fn tools() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn doc_with(real: usize, library: usize) -> Document {
+        use desigma_doc::{ensure_library_page, Node, Rect};
+        let mut d = Document::new("limit");
+        let page = d.add_page("P");
+        let lib = ensure_library_page(&mut d);
+        for (parent, n) in [(page, real), (lib, library)] {
+            for _ in 0..n {
+                let id = d.alloc_id();
+                d.insert(parent, Node::rectangle(id, Rect::new(0.0, 0.0, 1.0, 1.0))).unwrap();
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn layer_limit_counts_editable_layers_not_library_copies() {
+        // 40 nodes in total are over a limit of 20 only if the hidden library copies count.
+        assert!(validate_document_with_limit(&doc_with(10, 30), 20).is_ok());
+        assert!(validate_document_with_limit(&doc_with(1, 0), 20).is_ok());
+        let err = validate_document_with_limit(&doc_with(21, 0), 20).unwrap_err();
+        assert!(err.contains("20 layer limit"), "{err}");
+        assert!(validate_document(&doc_with(10, 30)).is_ok());
+    }
+
+    #[test]
+    fn a_damaged_library_page_is_an_error_not_a_hang_or_a_panic() {
+        // The limit is computed before the graph is checked, so it must survive what the check
+        // is there to report: a child linked twice (the count used to underflow) and a link
+        // back up to the library page (the walk used to never end).
+        let mut dup = doc_with(2, 3);
+        let lp = dup.library_page.unwrap();
+        let first = dup.get(lp).unwrap().children[0];
+        dup.nodes.get_mut(&lp).unwrap().children.push(first);
+        let err = validate_document(&dup).unwrap_err();
+        assert!(err.contains("duplicate or inconsistent child links"), "{err}");
+
+        let mut cycle = doc_with(2, 3);
+        let lp = cycle.library_page.unwrap();
+        let first = cycle.get(lp).unwrap().children[0];
+        cycle.nodes.get_mut(&first).unwrap().children.push(lp);
+        assert!(validate_document(&cycle).is_err());
+    }
 
     #[test]
     fn variable_inspection_and_codegen_resolve_inherited_cross_collection_aliases() {

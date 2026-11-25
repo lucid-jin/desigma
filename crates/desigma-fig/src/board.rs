@@ -266,6 +266,35 @@ pub(crate) fn finish_table(doc: &mut Document, id: NodeId) {
     sync_table(doc, id);
 }
 
+/// Completes a table whose cells arrived one at a time in row-major order.
+/// Grid dimensions come from the shallow table node; cell sizes are available
+/// after all streamed descendants have been imported.
+pub(crate) fn finish_streamed_table(doc: &mut Document, id: NodeId) {
+    let Some((rows, cols, cells)) = doc.get(id).and_then(|n| {
+        let NodeKind::Table(t) = &n.kind else { return None };
+        Some((t.rows(), t.cols(), n.children.clone()))
+    }) else {
+        return;
+    };
+    let mut col_widths = vec![TABLE_COL_W; cols];
+    let mut row_heights = vec![TABLE_ROW_H; rows];
+    for (index, cell) in cells.iter().copied().enumerate() {
+        let (row, col) = (index / cols, index % cols);
+        let Some(size) = doc.get(cell).map(|n| n.size) else { continue };
+        if row == 0 && col < cols && size.x > 0.0 {
+            col_widths[col] = size.x.max(TABLE_MIN_COL_W);
+        }
+        if col == 0 && row < rows && size.y > 0.0 {
+            row_heights[row] = size.y.max(TABLE_MIN_ROW_H);
+        }
+    }
+    if let Some(NodeKind::Table(t)) = doc.get_mut(id).map(|n| &mut n.kind) {
+        t.col_widths = col_widths;
+        t.row_heights = row_heights;
+    }
+    finish_table(doc, id);
+}
+
 /// Fix-ups after the generic node fields were parsed.
 pub(crate) fn finish_node(n: &mut Node) {
     match &mut n.kind {
@@ -326,6 +355,20 @@ pub(crate) fn link_connectors(doc: &mut Document, ids: &BTreeMap<String, NodeId>
     rec(doc, ids, root, &mut connectors);
     for c in connectors {
         sync_connector(doc, c);
+    }
+}
+
+/// Streaming equivalent of [`link_connectors`], using the small endpoint-id
+/// records collected while each shallow connector node was live.
+pub(crate) fn link_connector_targets(doc: &mut Document, ids: &BTreeMap<String, NodeId>, links: &[(NodeId, Option<String>, Option<String>)]) {
+    for (cid, start, end) in links {
+        let a = start.as_ref().and_then(|s| ids.get(s)).copied();
+        let b = end.as_ref().and_then(|s| ids.get(s)).copied();
+        if let Some(NodeKind::Connector(c)) = doc.get_mut(*cid).map(|n| &mut n.kind) {
+            c.start.node = a;
+            c.end.node = b;
+        }
+        sync_connector(doc, *cid);
     }
 }
 

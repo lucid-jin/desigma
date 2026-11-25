@@ -890,6 +890,7 @@ pub(crate) fn convert_fig(m: &mut Map<String, Value>, nc: &Value) {
 }
 
 /// Moves `_flowStart` markers on frames into the canvas' `flowStartingPoints`.
+#[allow(dead_code)]
 pub(crate) fn lift_flow_starts(page: &mut Value) {
     fn rec(v: &mut Value, out: &mut Vec<Value>) {
         let Some(obj) = v.as_object_mut() else { return };

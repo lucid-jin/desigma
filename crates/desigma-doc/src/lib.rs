@@ -118,7 +118,9 @@ pub struct Document {
     /// Timer and voting session of a board.
     #[serde(default)]
     pub board_session: BoardSession,
-    /// Embedded images keyed by content hash (Figma `imageRef`).
+    /// Embedded images keyed by content hash (Figma `imageRef`). New files encode each image as
+    /// one base64 string; the reader also accepts the numeric arrays written by older versions.
+    #[serde(with = "image_map_serde")]
     pub images: BTreeMap<String, Vec<u8>>,
     next_id: u64,
     /// Collaboration id range: when set, ids are `(peer << 40) | n`. Not saved.
@@ -126,6 +128,43 @@ pub struct Document {
     id_peer: Option<u64>,
     #[serde(skip)]
     peer_next: u64,
+}
+
+mod image_map_serde {
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+    use std::collections::BTreeMap;
+
+    pub fn serialize<S>(images: &BTreeMap<String, Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let encoded: BTreeMap<&str, String> = images.iter().map(|(key, bytes)| (key.as_str(), STANDARD.encode(bytes))).collect();
+        encoded.serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<BTreeMap<String, Vec<u8>>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum ImageBytes {
+            Base64(String),
+            Legacy(Vec<u8>),
+        }
+
+        BTreeMap::<String, ImageBytes>::deserialize(deserializer)?
+            .into_iter()
+            .map(|(key, value)| {
+                let bytes = match value {
+                    ImageBytes::Base64(text) => STANDARD.decode(text).map_err(D::Error::custom)?,
+                    ImageBytes::Legacy(bytes) => bytes,
+                };
+                Ok((key, bytes))
+            })
+            .collect()
+    }
 }
 
 /// Bits of a [`NodeId`] below the peer index in a collaboration session.
@@ -488,6 +527,23 @@ mod tests {
         d.insert(page, Node::rectangle(id, Rect::new(0.0, 0.0, 5.0, 5.0))).unwrap();
         let back = Document::from_json(&d.to_json().unwrap()).unwrap();
         assert_eq!(back.nodes.len(), 2);
+    }
+
+    #[test]
+    fn images_serialize_as_base64_and_roundtrip() {
+        let mut d = Document::new("images");
+        d.images.insert("hash".into(), vec![0, 1, 2, 255]);
+        let json = d.to_json().unwrap();
+        assert!(json.contains("\"AAEC/w==\""), "image bytes should be one compact base64 string");
+        assert_eq!(Document::from_json(&json).unwrap().images["hash"], vec![0, 1, 2, 255]);
+    }
+
+    #[test]
+    fn legacy_numeric_image_arrays_still_load() {
+        let mut value = serde_json::to_value(Document::new("legacy")).unwrap();
+        value["images"]["hash"] = serde_json::json!([0, 1, 2, 255]);
+        let back = Document::from_json(&value.to_string()).unwrap();
+        assert_eq!(back.images["hash"], vec![0, 1, 2, 255]);
     }
 
     #[test]

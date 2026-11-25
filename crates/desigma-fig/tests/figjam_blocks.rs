@@ -1,7 +1,8 @@
 //! FigJam `SECTION`, `TABLE` and `TABLE_CELL` nodes: import into the board kinds and export back.
 
 use desigma_doc::*;
-use desigma_fig::{export_rest_json, import_rest_json};
+use desigma_fig::{export_rest_json, import_fig_node_changes, import_rest_json};
+use serde_json::{json, Value};
 
 const BOARD: &str = r##"{
   "name": "Planning",
@@ -138,4 +139,46 @@ fn native_tables_and_sections_survive_an_export_import_cycle() {
     assert_eq!(tb.size, Vec2::new(2.0 * TABLE_COL_W, 3.0 * TABLE_ROW_H));
     let sb = find(&back, "Roadmap");
     assert!(matches!(&sb.kind, NodeKind::BoardSection(p) if p.color == SectionColor::LightViolet && !p.contents_hidden));
+}
+
+#[test]
+fn streaming_fig_table_preserves_grid_metadata_and_cell_order() {
+    fn guid(local: u64) -> Value {
+        json!({"sessionID": 1, "localID": local})
+    }
+    fn node(local: u64, parent: u64, position: &str, ty: &str, extra: Value) -> Value {
+        let mut value = json!({
+            "guid": guid(local),
+            "parentIndex": {"guid": guid(parent), "position": position},
+            "phase": "CREATED",
+            "type": ty,
+            "name": ty,
+            "size": {"x": 100.0, "y": 50.0}
+        });
+        value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        value
+    }
+
+    let changes = json!([
+        node(0, 0, "!", "DOCUMENT", json!({})),
+        node(1, 0, "a", "CANVAS", json!({})),
+        node(2, 1, "a", "TABLE", json!({"name": "Status", "numRows": 2, "numColumns": 3})),
+        // Deliberately not row-major in parent-position order.
+        node(3, 2, "a", "TABLE_CELL", json!({"rowIndex": 1, "columnIndex": 0, "characters": "second row", "size": {"x": 100.0, "y": 70.0}})),
+        node(4, 2, "b", "TABLE_CELL", json!({"rowIndex": 0, "columnIndex": 2, "characters": "Done", "size": {"x": 200.0, "y": 50.0}})),
+        node(5, 2, "c", "TABLE_CELL", json!({"rowIndex": 0, "columnIndex": 0, "characters": "Task", "size": {"x": 100.0, "y": 50.0}})),
+        node(6, 2, "d", "TABLE_CELL", json!({"rowIndex": 0, "columnIndex": 1, "characters": "Owner", "size": {"x": 180.0, "y": 50.0}}))
+    ]);
+
+    let doc = import_fig_node_changes(&changes, "table").unwrap();
+    let table = find(&doc, "Status");
+    let NodeKind::Table(props) = &table.kind else { panic!("{:?}", table.kind) };
+    assert_eq!((props.rows(), props.cols()), (2, 3));
+    assert_eq!(props.col_widths, vec![100.0, 180.0, 200.0]);
+    assert_eq!(props.row_heights, vec![50.0, 70.0]);
+    assert_eq!(table.children.len(), 6);
+    assert_eq!(cell_text(&doc, table.id, 0, 0), "Task");
+    assert_eq!(cell_text(&doc, table.id, 0, 1), "Owner");
+    assert_eq!(cell_text(&doc, table.id, 0, 2), "Done");
+    assert_eq!(cell_text(&doc, table.id, 1, 0), "second row");
 }

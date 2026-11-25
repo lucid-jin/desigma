@@ -348,6 +348,11 @@ struct Ctx {
     overlay_props: BTreeMap<String, Value>,
     /// `flowStartingPoints` of each page.
     flow_pages: Vec<(NodeId, Value)>,
+    /// Instance expansion stops once the document holds this many nodes.
+    max_nodes: usize,
+    /// Set when `max_nodes` stopped an expansion; the import then fails instead of returning a
+    /// document with half-copied instances.
+    over_budget: bool,
 }
 
 /// Overrides carried on `.fig` instance JSON as `_overrides` / `_derived`:
@@ -423,10 +428,21 @@ pub fn import_rest_json(json: &str) -> Result<Document, FigError> {
     import_rest_value(&v, false)
 }
 
+/// [`import_rest_json`] that expands instances and fails past `max_nodes`. For tests.
+#[doc(hidden)]
+pub fn import_rest_json_limited(json: &str, max_nodes: usize) -> Result<Document, FigError> {
+    let v = parse_json_text(json)?;
+    import_rest_value_limited(&v, true, max_nodes)
+}
+
 /// Maps an already-parsed REST-shaped value. `expand_instances` clones the
 /// component subtree into childless instances (used by `.fig`, where instance
 /// children are often not stored).
 pub(crate) fn import_rest_value(v: &Value, expand_instances: bool) -> Result<Document, FigError> {
+    import_rest_value_limited(v, expand_instances, crate::MAX_IMPORT_NODES)
+}
+
+pub(crate) fn import_rest_value_limited(v: &Value, expand_instances: bool, max_nodes: usize) -> Result<Document, FigError> {
     let root = match v.get("document") {
         Some(d) => d,
         None if fstr(v, "type").is_some() => v,
@@ -449,6 +465,8 @@ pub(crate) fn import_rest_value(v: &Value, expand_instances: bool) -> Result<Doc
         proto: Vec::new(),
         overlay_props: BTreeMap::new(),
         flow_pages: Vec::new(),
+        max_nodes,
+        over_budget: false,
     };
     if let Some(comps) = v.get("components").and_then(Value::as_object) {
         for (id, c) in comps {
@@ -479,6 +497,9 @@ pub(crate) fn import_rest_value(v: &Value, expand_instances: bool) -> Result<Doc
         }
     }
     cx.finish(expand_instances);
+    if cx.over_budget {
+        return Err(FigError::Unsupported(format!("expanding instances would exceed {max_nodes} nodes; the file has too many component instances to import")));
+    }
     cx.register_library_assets();
     cx.doc.kind = if crate::board::is_figjam(v) { DocumentKind::Board } else { DocumentKind::Design };
     if cx.doc.kind == DocumentKind::Board {
@@ -491,11 +512,138 @@ pub(crate) fn import_rest_value(v: &Value, expand_instances: bool) -> Result<Doc
     }
     crate::board::link_connectors(&mut cx.doc, &cx.ids, root);
     cx.link_remote_components(v);
+    cx.check_total_nodes()?;
     cx.doc.style_meta = style_meta(v.get("styles"), &cx.doc);
     Ok(cx.doc)
 }
 
+/// Incremental form of the REST importer used by `.fig` files. Callers feed
+/// one shallow converted REST node at a time in depth-first order.
+pub(crate) struct ImportSession {
+    cx: Ctx,
+    metadata: Value,
+    stack: Vec<(NodeId, ParentInfo, bool)>,
+    current_page: Option<NodeId>,
+    connectors: Vec<(NodeId, Option<String>, Option<String>)>,
+    expand_instances: bool,
+}
+
+impl ImportSession {
+    pub(crate) fn new(metadata: Value, expand_instances: bool) -> Self {
+        let mut cx = Ctx {
+            doc: Document::new(fstr(&metadata, "name").unwrap_or("Untitled")),
+            ids: BTreeMap::new(),
+            instances: Vec::new(),
+            unresolved: Vec::new(),
+            component_keys: BTreeMap::new(),
+            overrides: BTreeMap::new(),
+            next_clone: 0,
+            figjam: crate::board::is_figjam(&metadata),
+            override_keys: BTreeMap::new(),
+            scales: BTreeMap::new(),
+            library_keys: BTreeMap::new(),
+            pending_swaps: Vec::new(),
+            rest_overrides: Vec::new(),
+            proto: Vec::new(),
+            overlay_props: BTreeMap::new(),
+            flow_pages: Vec::new(),
+            max_nodes: crate::MAX_IMPORT_NODES,
+            over_budget: false,
+        };
+        if let Some(comps) = metadata.get("components").and_then(Value::as_object) {
+            for (id, c) in comps {
+                if let Some(k) = fstr(c, "key") {
+                    cx.component_keys.insert(id.clone(), k.to_string());
+                }
+            }
+        }
+        crate::variables::import_variables_value(&mut cx.doc, &metadata);
+        Self { cx, metadata, stack: Vec::new(), current_page: None, connectors: Vec::new(), expand_instances }
+    }
+
+    pub(crate) fn start_page(&mut self, page: &Value) {
+        self.stack.clear();
+        self.cx.import_page(page);
+        let Some(&pid) = self.cx.doc.pages.last() else { return };
+        self.current_page = Some(pid);
+        self.stack.push((pid, ParentInfo { origin: Vec2::ZERO, layout: None }, false));
+    }
+
+    pub(crate) fn start_library_page(&mut self) {
+        self.stack.clear();
+        self.current_page = None;
+        let lib = ensure_library_page(&mut self.cx.doc);
+        self.stack.push((lib, ParentInfo { origin: Vec2::ZERO, layout: None }, false));
+    }
+
+    pub(crate) fn start_node(&mut self, v: &Value) {
+        let Some((parent, pinfo, _)) = self.stack.last().copied() else { return };
+        let source = fstr(v, "id").map(String::from);
+        self.cx.import_node_inner(v, parent, pinfo, 0, true);
+        let Some(id) = source.as_ref().and_then(|s| self.cx.ids.get(s)).copied() else { return };
+        if let (Some(page), Some(name), Some(node_id)) = (self.current_page, v.get("_flowStart"), source.as_ref()) {
+            let name = name.as_str().filter(|s| !s.is_empty()).or_else(|| fstr(v, "name")).unwrap_or("");
+            if let Some((_, raw)) = self.cx.flow_pages.iter_mut().find(|(p, _)| *p == page) {
+                raw["flowStartingPoints"].as_array_mut().unwrap().push(serde_json::json!({"nodeId": node_id, "name": name}));
+            } else {
+                self.cx.flow_pages.push((page, serde_json::json!({"flowStartingPoints": [{"nodeId": node_id, "name": name}]})));
+            }
+        }
+        if fstr(v, "type") == Some("CONNECTOR") {
+            let target = |key: &str| v.get(key).and_then(|e| fstr(e, "endpointNodeId")).map(String::from);
+            self.connectors.push((id, target("connectorStart"), target("connectorEnd")));
+        }
+        let origin = abs_origin(v).unwrap_or(pinfo.origin);
+        let layout = self.cx.doc.get(id).and_then(|n| n.kind.frame_props()).and_then(|f| f.auto_layout).map(|a| a.direction);
+        self.stack.push((id, ParentInfo { origin, layout }, fstr(v, "type") == Some("TABLE")));
+    }
+
+    pub(crate) fn end_node(&mut self) {
+        if let Some((id, _, table)) = self.stack.pop() {
+            if table {
+                crate::board::finish_streamed_table(&mut self.cx.doc, id);
+            }
+        }
+    }
+
+    pub(crate) fn finish(mut self) -> Result<Document, FigError> {
+        self.cx.finish(self.expand_instances);
+        if self.cx.over_budget {
+            let max_nodes = self.cx.max_nodes;
+            return Err(FigError::Unsupported(format!(
+                "expanding instances would exceed {max_nodes} nodes; the file has too many component instances to import"
+            )));
+        }
+        self.cx.register_library_assets();
+        self.cx.doc.kind = if crate::board::is_figjam(&self.metadata) { DocumentKind::Board } else { DocumentKind::Design };
+        if self.cx.doc.kind == DocumentKind::Board {
+            for p in self.cx.doc.pages.clone() {
+                if let Some(NodeKind::Page { background }) = self.cx.doc.get_mut(p).map(|n| &mut n.kind) {
+                    background.a = 0.0;
+                }
+            }
+        }
+        crate::board::link_connector_targets(&mut self.cx.doc, &self.cx.ids, &self.connectors);
+        self.cx.link_remote_components(&self.metadata);
+        self.cx.check_total_nodes()?;
+        self.cx.doc.style_meta = style_meta(self.metadata.get("styles"), &self.cx.doc);
+        Ok(self.cx.doc)
+    }
+}
+
 impl Ctx {
+    /// The node budget after everything is in: instance expansion stops at the budget as it goes,
+    /// but linking remote components afterwards adds a placeholder per distinct unresolved one.
+    fn check_total_nodes(&self) -> Result<(), FigError> {
+        let (total, max) = (self.doc.nodes.len(), self.max_nodes);
+        if total > max {
+            return Err(FigError::Unsupported(format!(
+                "the import would hold {total} nodes, past the limit of {max} (the file uses too many remote components)"
+            )));
+        }
+        Ok(())
+    }
+
     fn import_page(&mut self, v: &Value) {
         let pid = self.doc.add_page(fstr(v, "name").unwrap_or("Page"));
         if let Some(src) = fstr(v, "id") {
@@ -526,6 +674,10 @@ impl Ctx {
     }
 
     fn import_node(&mut self, v: &Value, parent: NodeId, pinfo: ParentInfo, depth: usize) {
+        self.import_node_inner(v, parent, pinfo, depth, false);
+    }
+
+    fn import_node_inner(&mut self, v: &Value, parent: NodeId, pinfo: ParentInfo, depth: usize, defer_children: bool) {
         if depth > MAX_DEPTH {
             return;
         }
@@ -592,7 +744,9 @@ impl Ctx {
         }
         if container {
             let info = ParentInfo { origin, layout: my_layout };
-            if fstr(v, "type") == Some("TABLE") {
+            if defer_children {
+                // Descendants arrive in subsequent streaming calls.
+            } else if fstr(v, "type") == Some("TABLE") {
                 for c in crate::board::table_children(v) {
                     self.import_node(c, id, info, depth + 1);
                 }
@@ -888,6 +1042,9 @@ impl Ctx {
         let mut done = BTreeSet::new();
         let order: Vec<NodeId> = targets.keys().copied().collect();
         for inst in order {
+            if self.over_budget {
+                return;
+            }
             self.expand_rec(inst, &targets, &mut done);
         }
         // Instances whose component is unknown still honour their own overrides.
@@ -1256,7 +1413,11 @@ impl Ctx {
     }
 
     fn clone_subtree(&mut self, src: NodeId, parent: NodeId, prefix: &str, budget: &mut usize, depth: usize) {
-        if *budget == 0 || depth > MAX_DEPTH {
+        if *budget == 0 || depth > MAX_DEPTH || self.over_budget {
+            return;
+        }
+        if self.doc.nodes.len() >= self.max_nodes {
+            self.over_budget = true;
             return;
         }
         *budget -= 1;
