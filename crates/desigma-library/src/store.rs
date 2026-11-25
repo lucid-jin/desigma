@@ -10,6 +10,7 @@
 
 use crate::{new_id, Library, LibraryError, Result};
 use desigma_doc::{Document, DocumentKind, Vec2};
+pub use desigma_fig::{FigOutline, ImportOptions};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -135,13 +136,38 @@ pub const MAX_IMPORT_BYTES: u64 = 256 * 1024 * 1024;
 /// Figma REST), `.fig`, `.pen` (Pencil) or `.svg`. Files over [`MAX_IMPORT_BYTES`] are rejected
 /// before they are read.
 pub fn load_external(path: &Path) -> Result<Document> {
+    load_external_with(path, &ImportOptions::default())
+}
+
+fn check_import_size(path: &Path) -> Result<()> {
+    if std::fs::metadata(path)?.len() > MAX_IMPORT_BYTES {
+        return Err(LibraryError::Invalid(format!("Input file exceeds the {} MiB import limit", MAX_IMPORT_BYTES >> 20)));
+    }
+    Ok(())
+}
+
+/// What a `.fig` file holds (pages, top-level frames and their weight) without importing it, so
+/// a caller can pick frames for [`load_external_with`]. Subject to the same size limit as
+/// [`load_external`]. Only `.fig` files have an outline.
+pub fn inspect_external(path: &Path) -> Result<FigOutline> {
+    let is_fig = path.extension().and_then(|e| e.to_str()).is_some_and(|e| e.eq_ignore_ascii_case("fig"));
+    if !is_fig {
+        return Err(LibraryError::Invalid("Only .fig files have an outline".into()));
+    }
+    check_import_size(path)?;
+    desigma_fig::outline_fig(&std::fs::read(path)?).map_err(|e| LibraryError::Invalid(format!("Cannot read .fig: {e}")))
+}
+
+/// [`load_external`] with [`ImportOptions`]. Picking frames (`only_frames`) is for `.fig` files.
+pub fn load_external_with(path: &Path, opts: &ImportOptions) -> Result<Document> {
     let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
     let invalid = |m: String| LibraryError::Invalid(m);
-    if std::fs::metadata(path)?.len() > MAX_IMPORT_BYTES {
-        return Err(invalid(format!("Input file exceeds the {} MiB import limit", MAX_IMPORT_BYTES >> 20)));
+    check_import_size(path)?;
+    if opts.only_frames.is_some() && ext != "fig" {
+        return Err(invalid("Picking frames works for .fig files only".into()));
     }
     let mut doc = match ext.as_str() {
-        "fig" => desigma_fig::import_fig(&std::fs::read(path)?).map_err(|e| invalid(format!("Cannot import .fig: {e}")))?,
+        "fig" => desigma_fig::import_fig_with(&std::fs::read(path)?, opts).map_err(|e| invalid(format!("Cannot import .fig: {e}")))?,
         "pen" => {
             let opts = desigma_pen::Options { base_dir: path.parent().map(Path::to_path_buf), ..Default::default() };
             desigma_pen::import_with(&std::fs::read(path)?, &opts).map_err(|e| invalid(format!("Cannot import .pen: {e}")))?.document
@@ -951,6 +977,25 @@ mod tests {
         let old = t.0.join("old.desigma");
         std::fs::write(&old, doc("Old", 2).to_json().unwrap()).unwrap();
         assert_eq!(load_external(&old).unwrap().nodes.len(), 3);
+    }
+
+    #[test]
+    fn a_fig_file_can_be_inspected_and_imported_in_part() {
+        let (t, _lib) = Tmp::new();
+        let path = t.0.join("frames.fig");
+        std::fs::write(&path, desigma_fig::testkit::frames_fig()).unwrap();
+        let outline = inspect_external(&path).unwrap();
+        assert_eq!(outline.pages.len(), 3, "two pages and the hidden library page");
+        let hero = outline.pages[0].frames[0].id.clone();
+        let opts = ImportOptions { only_frames: Some([hero].into()) };
+        let part = load_external_with(&path, &opts).unwrap();
+        let all = load_external(&path).unwrap();
+        assert!(part.nodes.len() < all.nodes.len() && part.images.len() < all.images.len());
+        // not for other formats
+        let json = t.0.join("a.desigma");
+        std::fs::write(&json, doc("x", 1).to_json().unwrap()).unwrap();
+        assert!(load_external_with(&json, &opts).is_err());
+        assert!(inspect_external(&json).is_err());
     }
 
     #[test]

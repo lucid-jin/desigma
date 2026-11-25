@@ -4,6 +4,7 @@ use rmcp::{model::*, service::RequestContext, ErrorData, RoleServer, ServerHandl
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     sync::Mutex,
@@ -23,6 +24,9 @@ pub struct Session {
     mode: Option<Mode>,
     /// The `.desigma` file this session was opened from or last saved to, if any.
     path: Option<PathBuf>,
+    /// Production uses MAX_LAYERS; tests lower this to exercise the complete
+    /// import and validation path with small, realistic fixtures.
+    open_layer_limit: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -39,6 +43,13 @@ struct OpenArgs {
     path: String,
     #[serde(default)]
     discard_changes: bool,
+    #[serde(default)]
+    frames: Option<BTreeSet<String>>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InspectArgs {
+    path: String,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +70,15 @@ fn parse<T: serde::de::DeserializeOwned>(args: Value) -> Result<T, String> {
     serde_json::from_value(args).map_err(|e| format!("Invalid arguments: {e}"))
 }
 
+const SELECTION_NOTE: &str = "Selected frames are imported with their transitive dependencies, including component frames and used library components, so the number of selected frames can differ from the frames present after import.";
+
+fn add_selection_note(result: &mut Value, only_frames: Option<&BTreeSet<String>>) {
+    if let Some(frames) = only_frames {
+        result["selected_frame_count"] = json!(frames.len());
+        result["selection_note"] = json!(SELECTION_NOTE);
+    }
+}
+
 impl Session {
     pub fn new(root: &Path) -> Result<Self, String> {
         Self::with_discovery(root, crate::live::discovery_path())
@@ -68,11 +88,16 @@ impl Session {
     /// for a running editor). Tests use this to avoid ever touching a real
     /// developer's editor, which the default `new` would otherwise do.
     pub fn with_discovery(root: &Path, discovery: Option<PathBuf>) -> Result<Self, String> {
+        Self::with_discovery_and_open_layer_limit(root, discovery, crate::engine::MAX_LAYERS)
+    }
+
+    #[doc(hidden)]
+    pub fn with_discovery_and_open_layer_limit(root: &Path, discovery: Option<PathBuf>, open_layer_limit: usize) -> Result<Self, String> {
         let root = root.canonicalize().map_err(|e| format!("Cannot open workspace: {e}"))?;
         if !root.is_dir() {
             return Err("Workspace must be a directory".into());
         }
-        Ok(Self { engine: Engine::default(), root, dirty: false, discovery, mode: None, path: None })
+        Ok(Self { engine: Engine::default(), root, dirty: false, discovery, mode: None, path: None, open_layer_limit })
     }
 
     fn input_path(&self, path: &str) -> Result<PathBuf, String> {
@@ -204,6 +229,15 @@ impl Session {
         if name == "desigma_list_files" {
             return self.list_files();
         }
+        if name == "desigma_inspect_file" {
+            let a: InspectArgs = parse(args)?;
+            let path = self.input_path(&a.path)?;
+            let mut outline = desigma_library::inspect_external(&path).map_err(|e| format!("Cannot inspect design: {e}"))?;
+            for page in &mut outline.pages {
+                page.frames.sort_by(|a, b| crate::engine::compare_frame_rank(a.image_bytes, a.nodes, &a.id, b.image_bytes, b.nodes, &b.id));
+            }
+            return serde_json::to_value(outline).map_err(|e| format!("Cannot encode outline: {e}"));
+        }
         if name == "desigma_import_svg" {
             args = self.inline_svg(args)?;
         }
@@ -231,14 +265,25 @@ impl Session {
                 if self.dirty && !a.discard_changes {
                     return Err("Unsaved changes: save to a new .desigma file, or set discard_changes=true".into());
                 }
-                let path = self.input_path(&a.path)?;
-                let doc = desigma_library::load_external(&path).map_err(|e| format!("Cannot import design: {e}"))?;
-                crate::engine::validate_document(&doc)?;
+                let path = self.input_path(&a.path).map_err(crate::engine::generic_import_rejection_guidance)?;
+                let options = desigma_library::ImportOptions { only_frames: a.frames.clone() };
+                let doc = desigma_library::load_external_with(&path, &options)
+                    .map_err(|e| crate::engine::import_rejection_guidance(&path, format!("Cannot import design: {e}")))?;
+                match crate::engine::validate_opened_document_with_limit(&doc, self.open_layer_limit) {
+                    Ok(()) => {}
+                    Err(crate::engine::OpenedDocumentError::LayerLimit(error)) => {
+                        drop(doc);
+                        return Err(crate::engine::import_rejection_guidance(&path, error));
+                    }
+                    Err(crate::engine::OpenedDocumentError::Invalid(error)) => return Err(error),
+                }
                 self.engine = Engine::default();
                 self.engine.doc = doc;
                 self.dirty = false;
                 self.path = path.extension().is_some_and(|x| x == "desigma").then_some(path);
-                self.document(json!({}))
+                let mut result = self.document(json!({}))?;
+                add_selection_note(&mut result, a.frames.as_ref());
+                Ok(result)
             }
             "desigma_new_document" => {
                 let a: NewArgs = parse(args)?;
@@ -296,7 +341,7 @@ impl Session {
         match name {
             "desigma_open_file" => {
                 let a: OpenArgs = parse(args.clone())?;
-                args["path"] = json!(self.input_path(&a.path)?);
+                args["path"] = json!(self.input_path(&a.path).map_err(crate::engine::generic_import_rejection_guidance)?);
             }
             "desigma_save_file" => {
                 let a: SaveArgs = parse(args.clone())?;
@@ -337,7 +382,7 @@ impl DesigmaServer {
 pub fn tools() -> Vec<Tool> {
     let mut raw = crate::engine::tools();
     for (name, description, properties, required) in [
-        ("desigma_open_file", "Open a .desigma, .fig, .pen (Pencil), SVG or Figma REST JSON file inside the workspace: in the editor when its agent bridge is on, otherwise into the isolated file session. Refuses while the session (or the editor) has unsaved edits; ask the user to save, or pass discard_changes=true to throw them away. Call desigma_list_files for the path.", json!({"path":{"type":"string"},"discard_changes":{"type":"boolean","default":false}}), vec!["path"]),
+        ("desigma_open_file", "Open a .desigma, .fig, .pen (Pencil), SVG or Figma REST JSON file inside the workspace: in the editor when its agent bridge is on, otherwise into the isolated file session. For a .fig, call desigma_inspect_file first and pass frames to import selected top-level frames plus their transitive dependencies. Refuses while the session (or the editor) has unsaved edits; ask the user to save, or pass discard_changes=true to throw them away. Call desigma_list_files for the path.", json!({"path":{"type":"string"},"discard_changes":{"type":"boolean","default":false},"frames":{"type":"array","items":{"type":"string"},"uniqueItems":true,"description":"Top-level frame IDs returned by desigma_inspect_file. Valid only for .fig files. Selected frames and their transitive dependencies are imported."}}), vec!["path"]),
         ("desigma_save_file", "Save the document as a .desigma file inside the workspace (in the editor: a copy; its own file path is unchanged). By default the file must not exist yet; pass overwrite=true to replace an existing .desigma file atomically, e.g. the `path` desigma_get_document reports. Parent directory must exist.", json!({"path":{"type":"string"},"overwrite":{"type":"boolean","default":false}}), vec!["path"]),
         ("desigma_delete_page", "Delete a page and everything on it. Refuses to delete the last remaining page.", json!({"node_id":{"type":"integer","minimum":1}}), vec!["node_id"]),
         ("desigma_new_document", "Start a blank document with one page. Refuses while the session (or the editor) has unsaved edits; ask the user to save, or pass discard_changes=true to throw them away.", json!({"name":{"type":"string","minLength":1,"maxLength":1024},"discard_changes":{"type":"boolean","default":false}}), vec!["name"]),
@@ -346,6 +391,7 @@ pub fn tools() -> Vec<Tool> {
     }
     let id = json!({"type":"integer","minimum":1,"description":"Desigma numeric node ID; obtain from list_nodes/get_document."});
     raw.push(json!({"name":"desigma_list_files","description":"Design files this user can open. Each entry's path is inside the workspace and is valid for desigma_open_file. Library files are the Desigma library. shared/ is a copy of a file opened from outside the library, and only while the agent bridge is on.","inputSchema":{"type":"object","properties":{},"required":[],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}));
+    raw.push(json!({"name":"desigma_inspect_file","description":"Inspect a .fig file inside the workspace without importing it. Returns stored node/image totals and pages with top-level frames. Pages with internal=true are hidden library pages; their frame IDs cannot be selected directly, but required library components are imported transitively.","inputSchema":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}));
     raw.push(json!({"name":"desigma_get_selection","description":"Layers currently selected in the running editor. Requires the editor's agent bridge; errors in a file session.","inputSchema":{"type":"object","properties":{},"required":[],"additionalProperties":false},"annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}));
     raw.push(json!({"name":"desigma_select_nodes","description":"Select layers in the running editor and scroll/zoom to them (reveal=true). Requires the agent bridge.","inputSchema":{"type":"object","properties":{"node_ids":{"type":"array","items":id,"minItems":1,"maxItems":500},"reveal":{"type":"boolean","default":true}},"required":["node_ids"],"additionalProperties":false},"annotations":{"readOnlyHint":false,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}}));
     raw.into_iter().map(|v| serde_json::from_value(v).expect("valid built-in tool definition")).collect()

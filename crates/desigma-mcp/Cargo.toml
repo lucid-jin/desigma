@@ -19,6 +19,7 @@ rmcp = { version = "=3.5.1", default-features = false, features = ["server", "tr
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"], optional = true }
 
 [dev-dependencies]
+desigma-fig.workspace = true
 rmcp = { version = "=3.5.1", default-features = false, features = ["client", "transport-child-process"] }
 
 [[bin]]

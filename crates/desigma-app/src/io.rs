@@ -10,6 +10,13 @@ pub fn load_path(path: &Path) -> Result<Document, String> {
     load_path_noted(path).map(|(doc, _)| doc)
 }
 
+/// Loads through the shared library importer with frame-picking options while
+/// preserving the editor's importer panic boundary.
+pub fn load_path_with(path: &Path, options: &desigma_library::ImportOptions) -> Result<Document, String> {
+    let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    guard(&file, || desigma_library::load_external_with(path, options).map_err(|e| format!("Cannot import design: {e}")))
+}
+
 /// [`load_path`], plus notes on what an import could not carry over (empty for every format
 /// but `.pen`).
 pub fn load_path_noted(path: &Path) -> Result<(Document, Vec<String>), String> {
