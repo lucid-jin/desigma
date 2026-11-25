@@ -41,6 +41,34 @@ impl Drop for Workspace {
 }
 
 #[test]
+fn fig_outline_and_frame_selection_keep_the_public_contract() {
+    let dir = Workspace::new();
+    fs::write(dir.0.join("frames.fig"), desigma_fig::testkit::frames_fig()).unwrap();
+    fs::write(dir.0.join("plain.desigma"), desigma_doc::Document::new("plain").to_file_bytes().unwrap()).unwrap();
+    let mut s = Session::with_discovery(&dir.0, None).unwrap();
+
+    let outline = s.call("desigma_inspect_file", json!({"path":"frames.fig"})).unwrap();
+    assert_eq!((outline["stored_nodes"].as_u64(), outline["image_count"].as_u64(), outline["image_bytes"].as_u64()), (Some(19), Some(4), Some(15_000)));
+    assert_eq!(outline["pages"][0]["internal"], false);
+    assert_eq!(outline["pages"][2]["internal"], true, "hidden library pages stay visibly marked");
+
+    let empty = outline["pages"][0]["frames"][2]["id"].as_str().unwrap();
+    let opened = s.call("desigma_open_file", json!({"path":"frames.fig","frames":[empty]})).unwrap();
+    assert_eq!(opened["selected_frame_count"], 1);
+    assert!(opened["selection_note"].as_str().unwrap().contains("dependencies"));
+    assert_eq!(opened["node_count"], 9, "the picked frame brings its dependent frame and component subtree");
+
+    let err = s.call("desigma_open_file", json!({"path":"frames.fig","frames":[]})).unwrap_err();
+    assert!(err.contains("no frames were picked"), "{err}");
+    let err = s.call("desigma_open_file", json!({"path":"frames.fig","frames":["9:9"]})).unwrap_err();
+    assert!(err.contains("the file has no top-level frame with id 9:9"), "{err}");
+    let err = s.call("desigma_open_file", json!({"path":"plain.desigma","frames":["1:2"]})).unwrap_err();
+    assert!(err.contains("Picking frames works for .fig files only"), "{err}");
+    let err = s.call("desigma_inspect_file", json!({"path":"plain.desigma"})).unwrap_err();
+    assert!(err.contains("Only .fig files have an outline"), "{err}");
+}
+
+#[test]
 fn saved_file_roundtrip_and_unsaved_changes_guard() {
     let dir = Workspace::new();
     let mut s = Session::with_discovery(&dir.0, None).unwrap();

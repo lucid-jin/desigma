@@ -279,3 +279,31 @@ fn bridge_file_tools_act_on_the_editor_document() {
     s.shell.app.home = None;
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn bridge_can_open_selected_fig_frames_with_dependencies() {
+    let dir = std::env::temp_dir().join(format!("desigma_bridge_fig_pick_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let fig = dir.join("frames.fig");
+    let bytes = desigma_fig::testkit::frames_fig();
+    std::fs::write(&fig, &bytes).unwrap();
+    let outline = desigma_fig::outline_fig(&bytes).unwrap();
+    let empty = outline.pages[0].frames[2].id.clone();
+
+    let mut s = Sim::new();
+    let ctx = s.ctx.clone();
+    s.shell.app.start_bridge(&ctx).unwrap();
+    let (status, body) = send(&mut s, "desigma_open_file", json!({"path":fig,"frames":[empty]}));
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["result"]["selected_frame_count"], 1);
+    assert!(body["result"]["selection_note"].as_str().unwrap().contains("dependencies"));
+    assert!(s.app().doc.nodes.values().any(|n| n.name == "Empty"));
+    assert!(s.app().doc.nodes.values().any(|n| n.name == "Other"), "dependency frame comes along");
+    let before = s.app().doc.to_json().unwrap();
+    let (status, body) = send(&mut s, "desigma_open_file", json!({"path":fig,"frames":[]}));
+    assert_eq!(status, 422, "{body}");
+    assert!(body["error"].as_str().unwrap().contains("no frames were picked"));
+    assert_eq!(s.app().doc.to_json().unwrap(), before, "failed selection keeps the open document");
+    let _ = std::fs::remove_dir_all(&dir);
+}

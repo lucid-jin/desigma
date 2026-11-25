@@ -44,7 +44,7 @@ The client launches the process and speaks MCP over stdin/stdout. The server doe
 
 ## File workflow
 
-1. Call `desigma_open_file` with a path inside the configured workspace, or `desigma_new_document` with a name.
+1. Call `desigma_open_file` with a path inside the configured workspace, or `desigma_new_document` with a name. For a large `.fig`, call `desigma_inspect_file` first and pass one or more returned top-level frame IDs as `frames`.
 2. Use `desigma_get_document` to discover page IDs, then `desigma_list_nodes` and `desigma_get_node` to inspect layers. IDs are positive integers; obtain them from tool results rather than Figma node IDs.
 3. Inspect variables or generate handoff code. Make edits with the creation, update, and deletion tools; undo and redo operate on this session's edit history.
 4. Call `desigma_save_file` with an unused `.desigma` filename, or pass `"overwrite": true` to replace an existing one (for example the `path` that `desigma_get_document` reports for the file you opened). Its parent directory must already exist. Open the resulting file in the desktop editor to continue there.
@@ -53,6 +53,8 @@ Example tool arguments:
 
 ```text
 desigma_open_file     {"path":"input.fig"}
+desigma_inspect_file  {"path":"input.fig"}
+desigma_open_file     {"path":"input.fig","frames":["12:34","12:56"]}
 desigma_get_document  {}
 desigma_list_nodes    {"query":"button","limit":25}
 desigma_get_node      {"node_id":42}
@@ -65,6 +67,8 @@ desigma_save_file     {"path":"output-v2.desigma"}
 
 Edits remain in memory until saved. Restarting the server loses unsaved work. Opening another file or starting a new document resets undo history and refuses to discard pending edits unless `discard_changes: true` is explicitly supplied. Save each revision under a new filename, or overwrite the file you opened with `overwrite: true`. Requests are handled one at a time in the order they arrive, so a batch of calls written in one go runs and answers in sequence. Tool failures return an MCP error result with an explanatory message.
 
+`desigma_inspect_file` returns every page with an `internal` flag. Frames on `internal: true` hidden library pages cannot be selected directly. A selected import also brings the transitive component frames and used library components it depends on, so the number of selected frames can differ from the frames present after import. Outline `nodes` and `image_bytes` describe each stored frame itself, before dependency and instance expansion; they are not the final import cost.
+
 Imports are limited to 256 MiB per file, 100,000 layers (the hidden library page of a `.fig`, which holds non-editable copies of library components, is not counted), and 256 levels of nesting. A `.fig` that stores more than 150,000 nodes, or whose component instances would expand past 250,000 nodes, is rejected while it is being read. The server validates the imported document graph before using it, rejecting malformed parent/child relationships and cycles.
 
 ## Tools
@@ -72,7 +76,8 @@ Imports are limited to 256 MiB per file, 100,000 layers (the hidden library page
 | Tool | Purpose |
 | --- | --- |
 | `desigma_list_files` | Design files in this user's library, plus `shared/` copies of files opened from outside it while the agent bridge is on. Each `path` is valid for `desigma_open_file`. |
-| `desigma_open_file` | Import a native `.desigma`, `.fig`, `.pen` (Pencil), SVG, or supported JSON design into the session. |
+| `desigma_inspect_file` | Inspect a `.fig` without importing it; returns stored totals and pages/top-level frames with node and image weights. Hidden library pages are marked `internal: true`. |
+| `desigma_open_file` | Import a native `.desigma`, `.fig`, `.pen` (Pencil), SVG, or supported JSON design into the session. For `.fig`, `only_frames` imports selected top-level frames plus transitive dependencies. |
 | `desigma_new_document` | Start an empty document with one page. |
 | `desigma_save_file` | Write the session to a native `.desigma` file: a new one, or an existing one with `overwrite: true`. |
 | `desigma_get_document` | Read document name, pages, counts, undo/redo availability, and `session` (`"file"` or `"editor"`). |

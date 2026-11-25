@@ -8,7 +8,7 @@ use desigma_doc::{Command, Document, NodeId};
 use desigma_mcp::engine::{self, Host};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 /// Settings flag for Preferences → Allow MCP agents to control this editor.
 pub const FLAG: &str = "agent_bridge";
@@ -96,6 +96,8 @@ struct OpenArgs {
     path: PathBuf,
     #[serde(default)]
     discard_changes: bool,
+    #[serde(default)]
+    frames: Option<BTreeSet<String>>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -266,10 +268,20 @@ impl App {
                 if !a.path.is_absolute() {
                     return Err("Open path must be absolute".into());
                 }
-                let doc = crate::io::load_path(&a.path)?;
-                engine::validate_document(&doc)?;
+                let doc = if let Some(frames) = &a.frames {
+                    let options = desigma_library::ImportOptions { only_frames: Some(frames.clone()) };
+                    crate::io::load_path_with(&a.path, &options)?
+                } else {
+                    crate::io::load_path(&a.path)?
+                };
+                engine::validate_opened_document(&doc, a.frames.is_some())?;
                 self.replace_document(doc, Some(a.path));
-                self.bridge_document(json!({}))
+                let mut result = self.bridge_document(json!({}))?;
+                if let Some(frames) = a.frames {
+                    result["selected_frame_count"] = json!(frames.len());
+                    result["selection_note"] = json!("Selected frames are imported with their transitive dependencies, including component frames and used library components, so the number of selected frames can differ from the frames present after import.");
+                }
+                Ok(result)
             }
             "desigma_save_file" => {
                 let a: SaveArgs = parse(args)?;

@@ -223,6 +223,20 @@ pub fn validate_document(doc: &Document) -> Result<(), String> {
     validate_document_with_limit(doc, MAX_LAYERS)
 }
 
+/// Validates an imported document and, for a frame-picked import, explains how
+/// to recover from the editable-layer limit without retrying the whole file.
+pub fn validate_opened_document(doc: &Document, picked_frames: bool) -> Result<(), String> {
+    validate_document(doc).map_err(|error| add_frame_pick_guidance(error, picked_frames))
+}
+
+fn add_frame_pick_guidance(error: String, picked_frames: bool) -> String {
+    if picked_frames && error == format!("Document exceeds the {MAX_LAYERS} layer limit") {
+        format!("{error}. Pick fewer frames and try again; use desigma_inspect_file to compare each top-level frame's nodes and image_bytes")
+    } else {
+        error
+    }
+}
+
 fn validate_document_with_limit(doc: &Document, max_layers: usize) -> Result<(), String> {
     use std::collections::BTreeSet;
     // The hidden library page holds non-editable copies of library components; the limit is on
@@ -963,6 +977,18 @@ mod tests {
         let err = validate_document_with_limit(&doc_with(21, 0), 20).unwrap_err();
         assert!(err.contains("20 layer limit"), "{err}");
         assert!(validate_document(&doc_with(10, 30)).is_ok());
+    }
+
+    #[test]
+    fn picked_frame_layer_limit_explains_how_to_retry() {
+        let base = format!("Document exceeds the {MAX_LAYERS} layer limit");
+        let guided = add_frame_pick_guidance(base.clone(), true);
+        assert_eq!(
+            guided,
+            format!("{base}. Pick fewer frames and try again; use desigma_inspect_file to compare each top-level frame's nodes and image_bytes")
+        );
+        assert_eq!(add_frame_pick_guidance(base.clone(), false), base);
+        assert_eq!(add_frame_pick_guidance("other".into(), true), "other");
     }
 
     #[test]
