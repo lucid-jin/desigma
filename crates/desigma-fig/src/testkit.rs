@@ -1600,3 +1600,43 @@ pub fn frames_fig() -> Vec<u8> {
     }
     container::write_zip(&canvas, &images, Some(&serde_json::json!({"file_name": "Frames"})))
 }
+
+fn frames_fig_from(nodes: Vec<V>) -> Vec<u8> {
+    let body = msg(vec![("nodeChanges", V::Array(nodes)), ("blobs", V::Array(vec![]))]);
+    let schema = figma_like_schema();
+    let root = schema.find("Message").unwrap();
+    let canvas = container::write_container(&schema.encode(), &schema.encode_message(root, &body).unwrap(), Compression::Deflate, 107);
+    container::write_zip(&canvas, &BTreeMap::new(), Some(&serde_json::json!({"file_name": "Masks"})))
+}
+
+/// One page with the top-level frames `Before`, `Mask` (a mask), `Target` and `After`, in that
+/// order. A mask clips the siblings that follow it, so `Target` needs `Mask`; `Before` does not.
+pub fn masked_frames_fig() -> Vec<u8> {
+    let frame = |l: u32, pos: &str, name: &str, mask: bool| {
+        let mut extra = vec![("size", vec2(40.0, 40.0)), ("transform", matrix(10.0 * l as f32, 0.0))];
+        if mask {
+            extra.push(("mask", V::Bool(true)));
+        }
+        node((3, l), (0, 1), pos, "FRAME", name, extra)
+    };
+    frames_fig_from(vec![
+        node((0, 0), (0, 0), "!", "DOCUMENT", "Document", vec![]),
+        node((0, 1), (0, 0), "a", "CANVAS", "Page", vec![]),
+        frame(1, "a", "Before", false),
+        frame(2, "b", "Mask", true),
+        frame(3, "c", "Target", false),
+        frame(4, "d", "After", false),
+    ])
+}
+
+/// Two top-level frames that carry the same id, and a third frame.
+pub fn repeated_id_fig() -> Vec<u8> {
+    let frame = |l: u32, pos: &str, name: &str| node((3, l), (0, 1), pos, "FRAME", name, vec![("size", vec2(40.0, 40.0))]);
+    frames_fig_from(vec![
+        node((0, 0), (0, 0), "!", "DOCUMENT", "Document", vec![]),
+        node((0, 1), (0, 0), "a", "CANVAS", "Page", vec![]),
+        frame(1, "a", "First"),
+        frame(1, "b", "Twin"),
+        frame(2, "c", "Other"),
+    ])
+}

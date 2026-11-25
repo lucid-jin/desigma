@@ -122,13 +122,30 @@ pub fn outline_fig(bytes: &[u8]) -> Result<FigOutline, FigError> {
 /// swap candidate, a style, a node inside a component an override reaches). The units a unit
 /// depends on are followed in turn. Library components live in the hidden page's units, so a
 /// pick keeps the library parts it uses and leaves the rest of the library out.
-fn units_to_import(entries: &[Entry], nodes: Option<&[KiwiValue]>, tree: &Tree, only: &BTreeSet<String>) -> HashSet<usize> {
-    let by_id: HashMap<&str, usize> = entries.iter().enumerate().map(|(i, e)| (e.id.as_str(), i)).collect();
-    // which top-level unit every node sits in
+///
+/// A mask clips every sibling that follows it, which no id says: a unit also brings the masks
+/// that precede it on its page. Ids must be unique for any of this to mean one thing, so a file
+/// that repeats an id cannot be picked from.
+fn units_to_import(entries: &[Entry], nodes: Option<&[KiwiValue]>, tree: &Tree, only: &BTreeSet<String>) -> Result<HashSet<usize>, FigError> {
+    let mut by_id: HashMap<&str, usize> = HashMap::with_capacity(entries.len());
+    for (i, e) in entries.iter().enumerate() {
+        if by_id.insert(e.id.as_str(), i).is_some() {
+            return Err(FigError::Unsupported(format!("the file has more than one node with id {}, so frames cannot be picked from it", e.id)));
+        }
+    }
+    // which top-level unit every node sits in, and the masks before each unit on its page
     let mut unit_of: Vec<Option<usize>> = vec![None; entries.len()];
+    let mut masks_before: HashMap<usize, Vec<usize>> = HashMap::new();
     let mut picked = Vec::new();
     for &canvas in &tree.canvases {
+        let mut masks: Vec<usize> = Vec::new();
         for &top in tree.children.get(&canvas).into_iter().flatten() {
+            if !masks.is_empty() {
+                masks_before.insert(top, masks.clone());
+            }
+            if node_json(entries, nodes, top).get("mask").and_then(Value::as_bool) == Some(true) {
+                masks.push(top);
+            }
             if !entries[canvas].internal && only.contains(&entries[top].id) {
                 picked.push(top);
             }
@@ -142,8 +159,20 @@ fn units_to_import(entries: &[Entry], nodes: Option<&[KiwiValue]>, tree: &Tree, 
             }
         }
     }
-    let mut keep: HashSet<usize> = picked.iter().copied().collect();
-    let mut work = picked;
+    let mut keep: HashSet<usize> = HashSet::new();
+    let mut work = Vec::new();
+    let add = |unit: usize, keep: &mut HashSet<usize>, work: &mut Vec<usize>| {
+        let mut todo = vec![unit];
+        while let Some(u) = todo.pop() {
+            if keep.insert(u) {
+                work.push(u);
+                todo.extend(masks_before.get(&u).into_iter().flatten().copied());
+            }
+        }
+    };
+    for unit in picked {
+        add(unit, &mut keep, &mut work);
+    }
     while let Some(unit) = work.pop() {
         let mut stack = vec![unit];
         let mut seen = HashSet::new();
@@ -155,15 +184,15 @@ fn units_to_import(entries: &[Entry], nodes: Option<&[KiwiValue]>, tree: &Tree, 
             mentioned_ids(&node_json(entries, nodes, i), true, &mut ids);
             for id in ids {
                 if let Some(&j) = by_id.get(id.as_str()) {
-                    if let Some(u) = unit_of[j].filter(|u| keep.insert(*u)) {
-                        work.push(u);
+                    if let Some(u) = unit_of[j] {
+                        add(u, &mut keep, &mut work);
                     }
                 }
             }
             stack.extend(tree.children.get(&i).into_iter().flatten().copied());
         }
     }
-    keep
+    Ok(keep)
 }
 
 /// Ids (`session:local`) of every node a JSON value mentions, apart from the node's own `guid`
@@ -508,7 +537,7 @@ fn import_entries_streaming(
     only: Option<&BTreeSet<String>>,
 ) -> Result<Document, FigError> {
     let tree = Tree::new(&entries);
-    let keep = only.map(|set| units_to_import(&entries, nodes, &tree, set));
+    let keep = only.map(|set| units_to_import(&entries, nodes, &tree, set)).transpose()?;
     let Tree { children, canvases } = tree;
     let lk = Lk::new(&entries, blobs);
     let var_entries: Vec<&Value> = entries.iter().filter(|e| matches!(e.ty.as_str(), "VARIABLE_SET" | "VARIABLE")).map(|e| &e.json).collect();

@@ -1,7 +1,11 @@
 //! `outline_fig` lists what a `.fig` holds; `import_fig_with` imports only the frames picked.
 
 use desigma_doc::NodeKind;
-use desigma_fig::{import_fig, import_fig_with, outline_fig, testkit::frames_fig, ImportOptions};
+use desigma_fig::{
+    import_fig, import_fig_with, outline_fig,
+    testkit::{frames_fig, masked_frames_fig, repeated_id_fig},
+    ImportOptions,
+};
 use std::collections::BTreeSet;
 
 fn only(ids: &[&str]) -> ImportOptions {
@@ -103,4 +107,32 @@ fn a_pick_brings_the_frames_it_depends_on() {
     let instance = doc.nodes.values().find(|n| n.name == "Use Badge").unwrap();
     assert!(matches!(&instance.kind, NodeKind::Instance { .. }));
     assert!(!doc.nodes.values().any(|n| n.name == "Hero" || n.name == "Footer"));
+}
+
+fn id_of(bytes: &[u8], name: &str) -> String {
+    outline_fig(bytes).unwrap().pages.iter().flat_map(|p| &p.frames).find(|f| f.name == name).unwrap().id.clone()
+}
+
+#[test]
+fn a_pick_brings_the_masks_before_it_on_its_page() {
+    let fig = masked_frames_fig();
+    let doc = import_fig_with(&fig, &only(&[&id_of(&fig, "Target")])).unwrap();
+    assert_eq!(frame_names(&doc), ["Mask", "Target"], "the mask clips what follows it; the others are not needed");
+    let mask = doc.nodes.values().find(|n| n.name == "Mask").unwrap();
+    assert!(mask.is_mask, "and it is still a mask");
+    // a frame before the mask is not clipped by it
+    let doc = import_fig_with(&fig, &only(&[&id_of(&fig, "Before")])).unwrap();
+    assert_eq!(frame_names(&doc), ["Before"]);
+    // a mask picked on its own is just itself
+    let doc = import_fig_with(&fig, &only(&[&id_of(&fig, "Mask")])).unwrap();
+    assert_eq!(frame_names(&doc), ["Mask"]);
+}
+
+#[test]
+fn ids_that_repeat_cannot_be_picked_from() {
+    let fig = repeated_id_fig();
+    let err = import_fig_with(&fig, &only(&["3:2"])).unwrap_err().to_string();
+    assert!(err.contains("more than one node with id 3:1"), "{err}");
+    // importing everything does not depend on the ids being unique, and still works
+    assert!(import_fig(&fig).is_ok());
 }
