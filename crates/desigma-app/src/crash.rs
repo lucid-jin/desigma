@@ -19,6 +19,7 @@ pub fn install() {
         let location = info.location().map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
         let text = report(&payload_message(info.payload()), location.as_deref(), &std::backtrace::Backtrace::force_capture().to_string());
         write_report(&log_path(), &text);
+        crate::telemetry::panic_event(&payload_message(info.payload()), location.as_deref());
         prev(info);
     }));
 }

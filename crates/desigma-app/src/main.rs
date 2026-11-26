@@ -44,6 +44,7 @@ mod richtext;
 mod shell;
 mod showcase;
 mod styles;
+mod telemetry;
 mod textedit;
 mod textmeasure;
 mod theme;
@@ -165,7 +166,12 @@ fn main() {
         viewport = viewport.with_min_inner_size([200.0, 200.0]).with_resizable(true);
     }
     let native = eframe::NativeOptions { viewport, ..Default::default() };
+    telemetry::event("app_start", serde_json::json!({}));
     let result = eframe::run_native(theme::APP_TITLE, native, Box::new(move |cc| Ok(Box::new(shell::Shell::new(cc, opts)))));
+    if let Err(e) = &result {
+        telemetry::event("app_error", serde_json::json!({ "message": telemetry::scrub(&e.to_string()) }));
+    }
+    telemetry::flush();
     if let Err(e) = result {
         eprintln!("desigma: {e}");
         std::process::exit(1);

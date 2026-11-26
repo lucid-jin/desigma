@@ -14,14 +14,26 @@ pub fn load_path(path: &Path) -> Result<Document, String> {
 /// preserving the editor's importer panic boundary.
 pub fn load_path_with(path: &Path, options: &desigma_library::ImportOptions) -> Result<Document, String> {
     let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    guard(&file, || desigma_library::load_external_with(path, options).map_err(|e| format!("Cannot import design: {e}")))
+    traced(
+        path,
+        |doc: &Document| doc.nodes.len(),
+        || guard(&file, || desigma_library::load_external_with(path, options).map_err(|e| format!("Cannot import design: {e}"))),
+    )
 }
 
 /// [`load_path`], plus notes on what an import could not carry over (empty for every format
 /// but `.pen`).
 pub fn load_path_noted(path: &Path) -> Result<(Document, Vec<String>), String> {
     let file = path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
-    guard(&file, || load_unguarded(path))
+    traced(path, |(doc, _): &(Document, Vec<String>)| doc.nodes.len(), || guard(&file, || load_unguarded(path)))
+}
+
+/// Reports how an import went (see [`crate::telemetry`]): its time, size and result, never its content.
+fn traced<T>(path: &Path, nodes: impl Fn(&T) -> usize, load: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let started = std::time::Instant::now();
+    let result = load();
+    crate::telemetry::import_event(path, started, &result.as_ref().map(&nodes).map_err(String::as_str));
+    result
 }
 
 /// Runs an import so that a bug in an importer reports an error instead of closing the app.
