@@ -64,6 +64,10 @@ jobs:
       # (rc.exe ships with the runner's Windows SDK); it fails the build under CI
       # if that step breaks, so an icon-less exe is never released.
       - name: Build desigma, desigma-diff and desigma-mcp
+        env:
+          # Ingest-only Axiom token and dataset; when empty (a fork) the app sends nothing.
+          DESIGMA_AXIOM_TOKEN: ${{ secrets.DESIGMA_AXIOM_TOKEN }}
+          DESIGMA_AXIOM_DATASET: ${{ secrets.DESIGMA_AXIOM_DATASET }}
         run: cargo build --release --locked --target ${{ matrix.target }} -p desigma-app -p desigma-diff -p desigma-mcp
 
       - name: Check the stamped version
@@ -130,6 +134,10 @@ jobs:
           fi
 
       - name: Build both architectures
+        env:
+          # Ingest-only Axiom token and dataset; when empty (a fork) the app sends nothing.
+          DESIGMA_AXIOM_TOKEN: ${{ secrets.DESIGMA_AXIOM_TOKEN }}
+          DESIGMA_AXIOM_DATASET: ${{ secrets.DESIGMA_AXIOM_DATASET }}
         run: |
           for t in aarch64-apple-darwin x86_64-apple-darwin; do
             cargo build --release --locked --target "$t" -p desigma-app -p desigma-diff -p desigma-mcp
